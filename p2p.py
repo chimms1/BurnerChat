@@ -6,8 +6,8 @@ import time
 import json
 import base64
 import os
-import sqlite3
-
+import sqlite3  # Import sqlite3
+# import shelve (Remove shelve)
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import rsa, ec, padding
 from cryptography.hazmat.primitives import serialization, hashes
@@ -18,79 +18,78 @@ from cryptography.exceptions import InvalidSignature
 
 # --- Configuration ---
 MY_PORT = 42069
-INACTIVITY_TIMEOUT = 60.0
-DATABASE_FILE = 'chat_keys.db'
+INACTIVITY_TIMEOUT = 60.0  # 60 seconds
+DATABASE_FILE = 'chat_keys.db' # Use single DB file
+# PUBLIC_KEY_DB = 'rsa_key_db' (Remove)
+# MASTER_KEY_DB = 'master_key_db' (Remove)
 
-
+# --- AES-128 Configuration ---
 AES_KEY_SIZE = 16  # 16 bytes = 128 bits
-IV_SIZE = 16       # AES block size
+IV_SIZE = 16       # 16 bytes = AES block size
 
-connection_requests = queue.Queue() # for incoming connection requests
+# Thread-safe queue for incoming connection requests
+connection_requests = queue.Queue()
 
-stop_chat_thread = threading.Event()
+# --- 1. CRYPTOGRAPHIC HELPERS ---
 
-
-def load_my_private_key(myid):
-    
-    filename = f"{myid}.pem"
-    
+def load_my_private_key(my_id):
+    """Loads this user's RSA private key from their .pem file."""
+    filename = f"{my_id}.pem"
     try:
         with open(filename, "rb") as key_file:
-            
             return serialization.load_pem_private_key(
                 key_file.read(),
                 password=None,
                 backend=default_backend()
             )
-            
     except FileNotFoundError:
-        print(f"!! =>  CRITICAL: Private key file not found: {filename}")
+        print(f"[!] CRITICAL: Private key file not found: {filename}")
+        print("    Did you run setup_keys.py first? Or generate keys manually?")
         sys.exit(1)
 
-def load_peer_public_key(peerid):
-    
+def load_peer_public_key(peer_id):
+    """Loads a peer's RSA public key from the SQLite 'database'."""
     try:
         conn = sqlite3.connect(DATABASE_FILE)
         cursor = conn.cursor()
-        cursor.execute("SELECT public_key FROM peers WHERE id = ?", (peerid,))
+        cursor.execute("SELECT public_key FROM peers WHERE id = ?", (peer_id,))
         row = cursor.fetchone()
         conn.close()
         
         if row and row[0]:
-            # Key is stored as text, so encode to bytes
+            # Key is stored as text, so encode to bytes for loading
             pem_public = row[0].encode('utf-8')
-            
             return serialization.load_pem_public_key(
                 pem_public,
                 backend=default_backend()
             )
-            
         else:
-            print(f"!! =>  No public key found in database for ID: {peerid}")
+            print(f"[!] No public key found in database for ID: {peer_id}")
             return None
             
     except sqlite3.Error as e:
-        print(f"!! =>  SQLite error while loading public key: {e}")
+        print(f"[!] SQLite error while loading public key: {e}")
         return None
     except KeyError:
-        print(f"!! =>  No public key found in database for ID: {peerid}")
+        # This case is now handled by (row and row[0])
+        print(f"[!] No public key found in database for ID: {peer_id}")
         return None
 
-def sign_data(privatekey, data):
-    
-    return privatekey.sign(
-                data,
-                padding.PSS(
-                    mgf=padding.MGF1(hashes.SHA256()),
-                    salt_length=padding.PSS.MAX_LENGTH
-                ),
-                hashes.SHA256()
-            )
+def sign_data(private_key, data):
+    """Signs data with our RSA private key."""
+    return private_key.sign(
+        data,
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.MAX_LENGTH
+        ),
+        hashes.SHA256()
+    )
 
-def verify_signature(publickey, signature, data):
-    
+def verify_signature(public_key, signature, data):
+    """Verifies a signature using a peer's RSA public key."""
     try:
-        publickey.verify(
+        public_key.verify(
             signature,
             data,
             padding.PSS(
@@ -100,12 +99,11 @@ def verify_signature(publickey, signature, data):
             hashes.SHA256()
         )
         return True
-        
     except InvalidSignature:
         return False
 
-def derive_session_key(masterkey):
-    
+def derive_session_key(master_key):
+    """Derives a 128-bit (16-byte) session key from the master key."""
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
         length=AES_KEY_SIZE,  # 16 bytes for AES-128
@@ -113,10 +111,10 @@ def derive_session_key(masterkey):
         info=b'p2p-chat-session-key',
         backend=default_backend()
     )
-    return hkdf.derive(masterkey)
+    return hkdf.derive(master_key)
 
 def encrypt_message(session_key, message_str):
-    
+    """Encrypts a string with AES-128-CBC."""
     iv = os.urandom(IV_SIZE)
     cipher = Cipher(algorithms.AES(session_key), modes.CBC(iv), backend=default_backend())
     encryptor = cipher.encryptor()
@@ -154,7 +152,7 @@ def send_secure_message(sock, payload_bytes):
         msg_len = len(payload_bytes).to_bytes(4, 'big')
         sock.sendall(msg_len + payload_bytes)
     except (OSError, ConnectionResetError) as e:
-        print(f"!! =>  Error sending message: {e}")
+        print(f"[!] Error sending message: {e}")
         raise # Re-raise to be caught by the chat loop
 
 def recv_secure_message(sock):
@@ -182,7 +180,7 @@ def perform_handshake_initiator(sock, my_id, my_private_key, peer_id):
     print(f"--- Initiating handshake with {peer_id} ---")
     
     # 1. Check if we already have a master key
-    masterkey = None
+    master_key = None
     try:
         conn = sqlite3.connect(DATABASE_FILE)
         cursor = conn.cursor()
@@ -190,12 +188,12 @@ def perform_handshake_initiator(sock, my_id, my_private_key, peer_id):
         row = cursor.fetchone()
         conn.close()
         if row and row[0]:
-            masterkey = row[0] # This will be BLOB (bytes) or None
+            master_key = row[0] # This will be BLOB (bytes) or None
     except sqlite3.Error as e:
-        print(f"!! =>  SQLite error reading master key: {e}")
+        print(f"[!] SQLite error reading master key: {e}")
 
     # --- CASE 1: RESUME SESSION ---
-    if masterkey:
+    if master_key:
         print("  Found existing master key. Attempting session resumption...")
         nonce = os.urandom(32)
         data_to_sign = my_id.encode() + nonce
@@ -222,9 +220,9 @@ def perform_handshake_initiator(sock, my_id, my_private_key, peer_id):
             sig_data = response['id'].encode() + base64.b64decode(response['nonce'])
             if verify_signature(peer_rsa_pub, base64.b64decode(response['sig']), sig_data):
                 print("[+] Session Resumed!")
-                return derive_session_key(masterkey)
+                return derive_session_key(master_key)
             else:
-                print("!! =>  Resume ACK signature invalid! Aborting.")
+                print("[!] Resume ACK signature invalid! Aborting.")
                 return None
         else:
             print(f"  Resume failed (peer responded with {response.get('type')}).")
@@ -263,7 +261,7 @@ def perform_handshake_initiator(sock, my_id, my_private_key, peer_id):
     response = json.loads(response_bytes.decode())
     
     if response.get('type') != 'handshake_2' or response.get('id') != peer_id:
-        print("!! =>  Invalid handshake_2 response. Aborting.")
+        print("[!] Invalid handshake_2 response. Aborting.")
         return None
         
     # 5. Verify peer's signature
@@ -274,29 +272,29 @@ def perform_handshake_initiator(sock, my_id, my_private_key, peer_id):
     data_to_verify = response['id'].encode() + peer_ec_pub_bytes
     
     if not verify_signature(peer_rsa_pub, peer_sig, data_to_verify):
-        print("!! =>  Peer's handshake signature is INVALID! Aborting.")
+        print("[!] Peer's handshake signature is INVALID! Aborting.")
         return None
         
     print("  Peer signature verified.")
     
     # 6. Compute shared secret (Master Key)
     peer_ec_pub_key = serialization.load_pem_public_key(peer_ec_pub_bytes, default_backend())
-    masterkey = ec_private_key.exchange(ec.ECDH(), peer_ec_pub_key)
+    master_key = ec_private_key.exchange(ec.ECDH(), peer_ec_pub_key)
     
     # 7. Store master key in our DB
     try:
         conn = sqlite3.connect(DATABASE_FILE)
         cursor = conn.cursor()
-        # masterkey is bytes, which SQLite will store as BLOB
-        cursor.execute("UPDATE peers SET master_key = ? WHERE id = ?", (masterkey, peer_id))
+        # master_key is bytes, which SQLite will store as BLOB
+        cursor.execute("UPDATE peers SET master_key = ? WHERE id = ?", (master_key, peer_id))
         conn.commit()
         conn.close()
         print("  New Master Key computed and stored.")
     except sqlite3.Error as e:
-        print(f"!! =>  SQLite error storing master key: {e}")
+        print(f"[!] SQLite error storing master key: {e}")
     
     # 8. Derive session key
-    return derive_session_key(masterkey)
+    return derive_session_key(master_key)
 
 
 def perform_handshake_receiver(sock, my_id, my_private_key):
@@ -313,16 +311,16 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
     peer_id = msg.get('id')
     
     if not peer_id:
-        print("!! =>  Handshake message has no ID. Aborting.")
+        print("[!] Handshake message has no ID. Aborting.")
         return None, None
         
     print(f"  Handshake attempt from {peer_id}.")
     peer_rsa_pub = load_peer_public_key(peer_id)
     if not peer_rsa_pub:
-        print(f"!! =>  Unknown peer ID: {peer_id}. Aborting.")
+        print(f"[!] Unknown peer ID: {peer_id}. Aborting.")
         return None, None
         
-    masterkey = None
+    master_key = None
     try:
         conn = sqlite3.connect(DATABASE_FILE)
         cursor = conn.cursor()
@@ -330,15 +328,15 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
         row = cursor.fetchone()
         conn.close()
         if row and row[0]:
-            masterkey = row[0]
+            master_key = row[0]
     except sqlite3.Error as e:
-        print(f"!! =>  SQLite error reading master key: {e}")
+        print(f"[!] SQLite error reading master key: {e}")
 
 
     # --- CASE 1: RESUME SESSION ---
     if msg.get('type') == 'resume_1':
         print(f"  Processing 'resume_1' from {peer_id}...")
-        if not masterkey:
+        if not master_key:
             print("  Peer wants to resume, but we have no key. Sending fail.")
             fail_msg = {'type': 'resume_fail_no_key'}
             send_secure_message(sock, json.dumps(fail_msg).encode())
@@ -350,7 +348,7 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
         data_to_verify = peer_id.encode() + nonce
         
         if not verify_signature(peer_rsa_pub, sig, data_to_verify):
-            print("!! =>  Peer's resume signature is INVALID! Aborting.")
+            print("[!] Peer's resume signature is INVALID! Aborting.")
             return None, None
             
         print("  Peer signature verified. Sending resume_2 ACK.")
@@ -367,7 +365,7 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
         }
         send_secure_message(sock, json.dumps(resume_2).encode())
         print("[+] Session Resumed!")
-        return derive_session_key(masterkey), peer_id
+        return derive_session_key(master_key), peer_id
 
     # --- CASE 2: FULL HANDSHAKE ---
     elif msg.get('type') == 'handshake_1':
@@ -379,7 +377,7 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
         data_to_verify = peer_id.encode() + peer_ec_pub_bytes
         
         if not verify_signature(peer_rsa_pub, peer_sig, data_to_verify):
-            print("!! =>  Peer's handshake signature is INVALID! Aborting.")
+            print("[!] Peer's handshake signature is INVALID! Aborting.")
             return None, None
         
         print("  Peer signature verified.")
@@ -394,18 +392,18 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
         
         # 3. Compute shared secret (Master Key)
         peer_ec_pub_key = serialization.load_pem_public_key(peer_ec_pub_bytes, default_backend())
-    masterkey = ec_private_key.exchange(ec.ECDH(), peer_ec_pub_key)
+    master_key = ec_private_key.exchange(ec.ECDH(), peer_ec_pub_key)
         
     # 4. Store master key in our DB
     try:
         conn = sqlite3.connect(DATABASE_FILE)
         cursor = conn.cursor()
-        cursor.execute("UPDATE peers SET master_key = ? WHERE id = ?", (masterkey, peer_id))
+        cursor.execute("UPDATE peers SET master_key = ? WHERE id = ?", (master_key, peer_id))
         conn.commit()
         conn.close()
         print("  New Master Key computed and stored.")
     except sqlite3.Error as e:
-        print(f"!! =>  SQLite error storing master key: {e}")
+        print(f"[!] SQLite error storing master key: {e}")
         
     # 5. Sign our ID + ephemeral public key
         data_to_sign = my_id.encode() + ec_pub_bytes
@@ -422,10 +420,10 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
         print("  Sent handshake_2.")
         
         # 7. Derive session key
-        return derive_session_key(masterkey), peer_id
+        return derive_session_key(master_key), peer_id
         
     else:
-        print(f"!! =>  Unknown handshake message type: {msg.get('type')}")
+        print(f"[!] Unknown handshake message type: {msg.get('type')}")
         return None, None
 
 
@@ -443,15 +441,17 @@ def start_listener(my_ip, my_port):
 
         while True:
             conn, addr = s.accept()
-            print(f"\n!! =>  Incoming connection from {addr[0]}")
+            print(f"\n[!] Incoming connection from {addr[0]}")
             connection_requests.put((conn, addr))
             
     except OSError as e:
-        print(f"!! =>  Listener socket error: {e}")
+        print(f"[!] Listener socket error: {e}")
     finally:
         s.close()
         
 # --- 5. The Chat Session (Now with encryption) ---
+
+stop_chat_thread = threading.Event()
 
 def receive_messages(sock, session_key):
     """Target function for the receive thread."""
@@ -465,7 +465,7 @@ def receive_messages(sock, session_key):
             
             if not iv_and_ciphertext:
                 # Connection closed by peer
-                print("\n!! =>  Peer disconnected.")
+                print("\n[!] Peer disconnected.")
                 break
             
             # Decrypt the message
@@ -473,14 +473,14 @@ def receive_messages(sock, session_key):
             print(f"\rPeer: {message}      \nYou: ", end="")
 
         except socket.timeout:
-            print(f"\n!! =>  Chat timed out after {INACTIVITY_TIMEOUT}s of inactivity.")
+            print(f"\n[!] Chat timed out after {INACTIVITY_TIMEOUT}s of inactivity.")
             break
         except (OSError, ConnectionResetError):
             if not stop_chat_thread.is_set():
-                print("\n!! =>  Connection error in receive thread.")
+                print("\n[!] Connection error in receive thread.")
             break
         except Exception as e:
-            print(f"\n!! =>  Decryption error: {e}. Possible key mismatch or tampered message.")
+            print(f"\n[!] Decryption error: {e}. Possible key mismatch or tampered message.")
             break
             
     stop_chat_thread.set()
@@ -507,7 +507,7 @@ def start_chat_session(conn, session_key):
             message = input("You: ")
             
             if stop_chat_thread.is_set():
-                print("!! =>  Connection is closed. Cannot send message.")
+                print("[!] Connection is closed. Cannot send message.")
                 break
                 
             if message.lower() == 'exit':
@@ -522,7 +522,7 @@ def start_chat_session(conn, session_key):
         except (EOFError, KeyboardInterrupt):
             break
         except (OSError, ConnectionResetError):
-            print("!! =>  Connection closed.")
+            print("[!] Connection closed.")
             break
             
     stop_chat_thread.set()
@@ -609,9 +609,9 @@ def main_ui():
                     client_sock.close()
                     
             except (socket.error, ConnectionRefusedError) as e:
-                print(f"!! =>  Connection failed: {e}")
+                print(f"[!] Connection failed: {e}")
             except Exception as e:
-                print(f"!! =>  An error occurred during connection: {e}")
+                print(f"[!] An error occurred during connection: {e}")
                 if 'client_sock' in locals():
                     client_sock.close()
 
@@ -641,7 +641,7 @@ def main_ui():
                         conn.close()
                 
                 except Exception as e:
-                    print(f"!! =>  An error occurred during handshake: {e}")
+                    print(f"[!] An error occurred during handshake: {e}")
                     conn.close()
             
         elif choice == '3':
