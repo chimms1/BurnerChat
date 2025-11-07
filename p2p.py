@@ -332,7 +332,6 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
     except sqlite3.Error as e:
         print(f"[!] SQLite error reading master key: {e}")
 
-
     # --- CASE 1: RESUME SESSION ---
     if msg.get('type') == 'resume_1':
         print(f"  Processing 'resume_1' from {peer_id}...")
@@ -340,7 +339,8 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
             print("  Peer wants to resume, but we have no key. Sending fail.")
             fail_msg = {'type': 'resume_fail_no_key'}
             send_secure_message(sock, json.dumps(fail_msg).encode())
-            return None, None # Force them to start a full handshake
+            # We return None, but the initiator *should* retry with a full handshake
+            return None, None
             
         # Verify their signature
         nonce = base64.b64decode(msg['nonce'])
@@ -392,20 +392,20 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
         
         # 3. Compute shared secret (Master Key)
         peer_ec_pub_key = serialization.load_pem_public_key(peer_ec_pub_bytes, default_backend())
-    master_key = ec_private_key.exchange(ec.ECDH(), peer_ec_pub_key)
+        master_key = ec_private_key.exchange(ec.ECDH(), peer_ec_pub_key)
         
-    # 4. Store master key in our DB
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE peers SET master_key = ? WHERE id = ?", (master_key, peer_id))
-        conn.commit()
-        conn.close()
-        print("  New Master Key computed and stored.")
-    except sqlite3.Error as e:
-        print(f"[!] SQLite error storing master key: {e}")
+        # 4. Store master key in our DB
+        try:
+            conn = sqlite3.connect(DATABASE_FILE)
+            cursor = conn.cursor()
+            cursor.execute("UPDATE peers SET master_key = ? WHERE id = ?", (master_key, peer_id))
+            conn.commit()
+            conn.close()
+            print("  New Master Key computed and stored.")
+        except sqlite3.Error as e:
+            print(f"[!] SQLite error storing master key: {e}")
         
-    # 5. Sign our ID + ephemeral public key
+        # 5. Sign our ID + ephemeral public key
         data_to_sign = my_id.encode() + ec_pub_bytes
         signature = sign_data(my_private_key, data_to_sign)
         
@@ -420,12 +420,14 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
         print("  Sent handshake_2.")
         
         # 7. Derive session key
+        #
+        # !!! THIS IS THE LINE THAT WAS LIKELY MISSING !!!
+        #
         return derive_session_key(master_key), peer_id
         
     else:
         print(f"[!] Unknown handshake message type: {msg.get('type')}")
         return None, None
-
 
 # --- 4. The Listener Thread (Unchanged) ---
 
