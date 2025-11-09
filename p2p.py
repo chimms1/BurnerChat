@@ -19,7 +19,7 @@ from cryptography.exceptions import InvalidSignature
 MY_PORT = 42069
 INACTIVITY_TIMEOUT = 60.0
 DATABASE_FILE = 'chat_keys.db'
-REKEY_AFTER_MESSAGES = 10 # Re-key after 10 messages total (send/recv)
+REKEY_AFTER_MESSAGES = 5 # Re-key after 5 messages on each chain
 
 # --- AES-128 Configuration ---
 AES_KEY_SIZE = 16
@@ -98,27 +98,21 @@ def verify_signature(public_key, signature, data):
     except InvalidSignature:
         return False
 
-def derive_session_key(master_key, epoch):
+def kdf_chain_step(key_material, info_str):
     """
-    Derives a 128-bit (16-byte) session key from the master key
-    for a specific epoch.
+    General-purpose KDF to derive a new 16-byte (AES-128) key.
+    Used for deriving initial keys and for ratcheting.
     """
-    # We use the epoch in the 'info' field to ensure each derived key is unique
-    info_str = f'p2p-chat-epoch-{epoch}'.encode()
+    info_bytes = info_str.encode()
     
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
         length=AES_KEY_SIZE,
         salt=None,
-        info=info_str,
+        info=info_bytes,
         backend=default_backend()
     )
-    
-    res = hkdf.derive(master_key)
-    
-    print(" ===== Current session key: {} =======".format(res))
-    
-    return res
+    return hkdf.derive(key_material)
 
 def encrypt_message(session_key, message_str):
     """Encrypts a string with AES-128-CBC."""
@@ -172,13 +166,11 @@ def recv_secure_message(sock):
     except (OSError, ConnectionResetError):
         return None
         
-# --- 3. HANDSHAKE LOGIC ---
+# --- 3. HANDSHAKE LOGIC (Unchanged from previous step) ---
 
 def perform_handshake_initiator(sock, my_id, my_private_key, peer_id):
-    """Initiator side of the handshake."""
+    """Initiator side of the handshake. Always performs full ECDHE."""
     print(f"--- Initiating handshake with {peer_id} ---")
-    
-    # --- We no longer check for an existing key. We ALWAYS do a full handshake. ---
     
     print("  Performing full ECDHE handshake...")
     ec_private_key = ec.generate_private_key(ec.SECP384R1(), default_backend())
@@ -225,14 +217,13 @@ def perform_handshake_initiator(sock, my_id, my_private_key, peer_id):
     peer_ec_pub_key = serialization.load_pem_public_key(peer_ec_pub_bytes, default_backend())
     master_key = ec_private_key.exchange(ec.ECDH(), peer_ec_pub_key)
     
-    # --- We no longer store the master_key in the database ---
     print("  New Master Key computed (in memory only).")
     
     return master_key # <-- RETURN MASTER KEY
 
 
 def perform_handshake_receiver(sock, my_id, my_private_key):
-    """Receiver side of the handshake."""
+    """Receiver side of the handshake. Always performs full ECDHE."""
     print("--- Awaiting handshake ---")
     
     msg_bytes = recv_secure_message(sock)
@@ -253,11 +244,6 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
         print(f"[!] Unknown peer ID: {peer_id}. Aborting.")
         return None, None
         
-    # --- We no longer check for an existing key. ---
-    
-    # --- CASE 1: RESUME SESSION (REMOVED) ---
-    
-    # --- CASE 2: FULL HANDSHAKE ---
     if msg.get('type') == 'handshake_1':
         print(f"  Processing 'handshake_1' from {peer_id}...")
         
@@ -281,7 +267,6 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
         peer_ec_pub_key = serialization.load_pem_public_key(peer_ec_pub_bytes, default_backend())
         master_key = ec_private_key.exchange(ec.ECDH(), peer_ec_pub_key)
         
-        # --- We no longer store the master_key in the database ---
         print("  New Master Key computed (in memory only).")
         
         data_to_sign = my_id.encode() + ec_pub_bytes
@@ -324,62 +309,58 @@ def start_listener(my_ip, my_port):
     finally:
         s.close()
         
-# --- 5. The Chat Session (NOW Encrypted, Signed, AND Ratcheting) ---
+# --- 5. The Chat Session (Dual Ratchet Logic) ---
 
 stop_chat_thread = threading.Event()
 
 def receive_messages(sock, chat_state, peer_public_key):
     """
     Target function for the receive thread.
-    Decrypts messages, verifies signatures, and handles re-keying.
+    Manages the RECEIVING chain key.
     """
     global stop_chat_thread
     sock.settimeout(INACTIVITY_TIMEOUT)
     
     while not stop_chat_thread.is_set():
         try:
-            # 1. Receive the length-prefixed, encrypted payload
             iv_and_ciphertext = recv_secure_message(sock)
             
             if not iv_and_ciphertext:
                 print("\n[!] Peer disconnected.")
                 break
 
-            # 2. Get the current key and state *atomically*
             current_key_to_use = None
             with chat_state['lock']:
-                # Increment shared counter
-                chat_state['count'] += 1
+                # Increment receiving count
+                chat_state['receiving_count'] += 1
                 
-                # Check if it's time to re-key
-                if chat_state['count'] > REKEY_AFTER_MESSAGES:
-                    print(f"\n[!] ({REKEY_AFTER_MESSAGES} messages passed) RE-KEYING SESSION (Receive)...")
-                    chat_state['epoch'] += 1
-                    chat_state['session_key'] = derive_session_key(
-                        chat_state['master_key'], chat_state['epoch']
+                # Check if it's time to re-key the RECEIVING chain
+                if chat_state['receiving_count'] > REKEY_AFTER_MESSAGES:
+                    print(f"\n[!] ({REKEY_AFTER_MESSAGES} msgs received) RE-KEYING (Receive Chain)...")
+                    # Derive new key from old key
+                    chat_state['receiving_key'] = kdf_chain_step(
+                        chat_state['receiving_key'], 
+                        "ratchet-step" # Use a constant string
                     )
-                    chat_state['count'] = 1 # This is message 1 of the new epoch
-                    print(f"[!] New session key for epoch {chat_state['epoch']} derived.")
+                    chat_state['receiving_count'] = 1 # This is message 1 of the new key
+                    print(f"[!] New receiving key derived.")
 
-                current_key_to_use = chat_state['session_key']
+                current_key_to_use = chat_state['receiving_key']
             
-            # 3. Decrypt the payload to get the JSON string
+            # Decrypt the payload to get the JSON string
             message_json_str = decrypt_message(current_key_to_use, iv_and_ciphertext)
             
-            # 4. Unpack the JSON
             payload = json.loads(message_json_str)
             message_text = payload['msg']
             signature_b64 = payload['sig']
             
-            # 5. Verify the signature
+            # Verify the signature
             signature_bytes = base64.b64decode(signature_b64)
             data_to_verify = message_text.encode('utf-8')
             
             if verify_signature(peer_public_key, signature_bytes, data_to_verify):
-                # 6. Display if valid
                 print(f"\rPeer: {message_text}      \nYou: ", end="")
             else:
-                # 6. Show error if invalid
                 print(f"\n[!] INVALID SIGNATURE received for message: '{message_text}'")
                 print("You: ", end="") # Re-draw prompt
 
@@ -404,33 +385,31 @@ def receive_messages(sock, chat_state, peer_public_key):
     except OSError:
         pass 
 
-def start_chat_session(conn, master_key, peer_id, my_private_key):
+def start_chat_session(conn, initial_sending_key, initial_receiving_key, peer_id, my_private_key):
     """
-    Manages an active 1-on-1 ENCRYPTED and SIGNED chat.
-    Now manages a shared state for re-keying.
+    Manages an active chat with separate send/receive ratchets.
     """
     global stop_chat_thread
     stop_chat_thread.clear()
     
-    # Load the peer's public key once for the receive thread
     peer_public_key = load_peer_public_key(peer_id)
     if not peer_public_key:
         print(f"[!] Critical: Could not load peer's public key for {peer_id}. Cannot verify messages.")
         conn.close()
         return
 
-    # Create the shared state object
+    # Create the shared state object for both chains
     chat_state = {
         'lock': threading.Lock(),
-        'count': 0,                     # Shared message counter
-        'epoch': 1,                     # Key epoch
-        'master_key': master_key,       # Unchanging master key
-        'session_key': derive_session_key(master_key, 1) # Initial session key
+        'sending_key': initial_sending_key,
+        'sending_count': 0,
+        'receiving_key': initial_receiving_key,
+        'receiving_count': 0
     }
 
-    print(f"\n--- SECURE & VERIFIED Chat Started! (Re-keys every {REKEY_AFTER_MESSAGES} msgs) ---")
+    print(f"\n--- SECURE Ratchet Chat Started! (Re-keys every {REKEY_AFTER_MESSAGES} msgs per chain) ---")
 
-    # Start the receive thread, passing it the shared state
+    # Start the receive thread
     receiver = threading.Thread(
         target=receive_messages, 
         args=(conn, chat_state, peer_public_key), 
@@ -456,18 +435,21 @@ def start_chat_session(conn, master_key, peer_id, my_private_key):
             current_key_to_use = None
             # Atomically update counter and get current key
             with chat_state['lock']:
-                chat_state['count'] += 1
+                # Increment SENDING count
+                chat_state['sending_count'] += 1
                 
-                if chat_state['count'] > REKEY_AFTER_MESSAGES:
-                    print(f"\n[!] ({REKEY_AFTER_MESSAGES} messages passed) RE-KEYING SESSION (Send)...")
-                    chat_state['epoch'] += 1
-                    chat_state['session_key'] = derive_session_key(
-                        chat_state['master_key'], chat_state['epoch']
+                # Check if it's time to re-key the SENDING chain
+                if chat_state['sending_count'] > REKEY_AFTER_MESSAGES:
+                    print(f"\n[!] ({REKEY_AFTER_MESSAGES} msgs sent) RE-KEYING (Send Chain)...")
+                    # Derive new key from old key
+                    chat_state['sending_key'] = kdf_chain_step(
+                        chat_state['sending_key'], 
+                        "ratchet-step" # Use the same constant string
                     )
-                    chat_state['count'] = 1 # This is message 1 of the new epoch
-                    print(f"[!] New session key for epoch {chat_state['epoch']} derived.")
+                    chat_state['sending_count'] = 1 # This is message 1 of the new key
+                    print(f"[!] New sending key derived.")
                 
-                current_key_to_use = chat_state['session_key']
+                current_key_to_use = chat_state['sending_key']
 
             # 1. Sign the message
             data_to_sign = message_text.encode('utf-8')
@@ -480,11 +462,11 @@ def start_chat_session(conn, master_key, peer_id, my_private_key):
             }
             message_json_str = json.dumps(payload)
 
-            # 3. Encrypt the JSON string using the key for this epoch
-            
+            # 3. Encrypt the JSON string using the current SENDING key
+            print("Message => {} current_key => {}".format(message_json_str, current_key_to_use))
             iv_and_ciphertext = encrypt_message(current_key_to_use, message_json_str)
             
-            # 4. Send securely (with length prefix)
+            # 4. Send securely
             send_secure_message(conn, iv_and_ciphertext)
             
         except (EOFError, KeyboardInterrupt):
@@ -545,6 +527,7 @@ def main_ui():
         choice = input("Enter your choice (1-3): ")
 
         if choice == '1':
+            # This is the INITIATOR
             target_ip = input("Enter peer's IP address: ")
             target_id = input(f"Enter peer's ID (e.g., peer_B): ")
             
@@ -557,7 +540,6 @@ def main_ui():
                 client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 client_sock.connect((target_ip, MY_PORT))
                 
-                # Handshake now returns the master_key
                 master_key = perform_handshake_initiator(
                     client_sock, 
                     MY_ID, 
@@ -566,9 +548,19 @@ def main_ui():
                 )
                 
                 if master_key:
-                    print("[+] Handshake successful!")
-                    # Pass the master_key to start_chat_session
-                    start_chat_session(client_sock, master_key, target_id, MY_PRIVATE_KEY)
+                    print("[+] Handshake successful! Deriving chain keys...")
+                    # Initiator's sending key
+                    init_send_key = kdf_chain_step(master_key, "initiator-sends")
+                    # Initiator's receiving key (derived from peer's send key)
+                    init_recv_key = kdf_chain_step(master_key, "receiver-sends")
+                    
+                    start_chat_session(
+                        client_sock, 
+                        init_send_key, 
+                        init_recv_key, 
+                        target_id, 
+                        MY_PRIVATE_KEY
+                    )
                 else:
                     print("[-] Handshake failed. Connection closed.")
                     client_sock.close()
@@ -581,6 +573,7 @@ def main_ui():
                     client_sock.close()
 
         elif choice == '2':
+            # This is the RECEIVER
             if connection_requests.empty():
                 print("No pending connection requests.")
             else:
@@ -588,7 +581,6 @@ def main_ui():
                 print(f"\nProcessing incoming request from {addr[0]}...")
                 
                 try:
-                    # Handshake now returns master_key and peer_id
                     master_key, peer_id = perform_handshake_receiver(
                         conn, 
                         MY_ID, 
@@ -596,10 +588,19 @@ def main_ui():
                     )
                     
                     if master_key and peer_id:
-                        print(f"[+] Handshake with {peer_id} successful!")
-                        # Pass the master_key to start_chat_session
-                        start_chat_session(conn, master_key, peer_id, MY_PRIVATE_KEY)
-                        # No break here, allow main loop to continue after chat
+                        print(f"[+] Handshake with {peer_id} successful! Deriving chain keys...")
+                        # Receiver's sending key
+                        recv_send_key = kdf_chain_step(master_key, "receiver-sends")
+                        # Receiver's receiving key (derived from peer's send key)
+                        recv_recv_key = kdf_chain_step(master_key, "initiator-sends")
+                        
+                        start_chat_session(
+                            conn, 
+                            recv_send_key, 
+                            recv_recv_key, 
+                            peer_id, 
+                            MY_PRIVATE_KEY
+                        )
                     else:
                         print("[-] Handshake failed. Closing connection.")
                         conn.close()
