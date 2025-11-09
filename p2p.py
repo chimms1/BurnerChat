@@ -173,54 +173,8 @@ def perform_handshake_initiator(sock, my_id, my_private_key, peer_id):
     """Initiator side of the handshake."""
     print(f"--- Initiating handshake with {peer_id} ---")
     
-    master_key = None
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
-        cursor.execute("SELECT master_key FROM peers WHERE id = ?", (peer_id,))
-        row = cursor.fetchone()
-        conn.close()
-        if row and row[0]:
-            master_key = row[0]
-    except sqlite3.Error as e:
-        print(f"[!] SQLite error reading master key: {e}")
-
-    # --- CASE 1: RESUME SESSION ---
-    if master_key:
-        print("  Found existing master key. Attempting session resumption...")
-        nonce = os.urandom(32)
-        data_to_sign = my_id.encode() + nonce
-        signature = sign_data(my_private_key, data_to_sign)
-        
-        handshake_msg = {
-            'type': 'resume_1',
-            'id': my_id,
-            'nonce': base64.b64encode(nonce).decode('utf-8'),
-            'sig': base64.b64encode(signature).decode('utf-8')
-        }
-        send_secure_message(sock, json.dumps(handshake_msg).encode())
-        
-        response_bytes = recv_secure_message(sock)
-        if not response_bytes:
-            print("  Peer disconnected during resume.")
-            return None
-        
-        response = json.loads(response_bytes.decode())
-        
-        if response.get('type') == 'resume_2':
-            peer_rsa_pub = load_peer_public_key(peer_id)
-            sig_data = response['id'].encode() + base64.b64decode(response['nonce'])
-            if verify_signature(peer_rsa_pub, base64.b64decode(response['sig']), sig_data):
-                print("[+] Session Resumed!")
-                return master_key  # <-- RETURN MASTER KEY
-            else:
-                print("[!] Resume ACK signature invalid! Aborting.")
-                return None
-        else:
-            print(f"  Resume failed (peer responded with {response.get('type')}).")
-            pass
-
-    # --- CASE 2: FULL HANDSHAKE ---
+    # --- We no longer check for an existing key. We ALWAYS do a full handshake. ---
+    
     print("  Performing full ECDHE handshake...")
     ec_private_key = ec.generate_private_key(ec.SECP384R1(), default_backend())
     ec_public_key = ec_private_key.public_key()
@@ -266,15 +220,8 @@ def perform_handshake_initiator(sock, my_id, my_private_key, peer_id):
     peer_ec_pub_key = serialization.load_pem_public_key(peer_ec_pub_bytes, default_backend())
     master_key = ec_private_key.exchange(ec.ECDH(), peer_ec_pub_key)
     
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE peers SET master_key = ? WHERE id = ?", (master_key, peer_id))
-        conn.commit()
-        conn.close()
-        print("  New Master Key computed and stored.")
-    except sqlite3.Error as e:
-        print(f"[!] SQLite error storing master key: {e}")
+    # --- We no longer store the master_key in the database ---
+    print("  New Master Key computed (in memory only).")
     
     return master_key # <-- RETURN MASTER KEY
 
@@ -301,52 +248,12 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
         print(f"[!] Unknown peer ID: {peer_id}. Aborting.")
         return None, None
         
-    master_key = None
-    try:
-        conn = sqlite3.connect(DATABASE_FILE)
-        cursor = conn.cursor()
-        cursor.execute("SELECT master_key FROM peers WHERE id = ?", (peer_id,))
-        row = cursor.fetchone()
-        conn.close()
-        if row and row[0]:
-            master_key = row[0]
-    except sqlite3.Error as e:
-        print(f"[!] SQLite error reading master key: {e}")
-
-    # --- CASE 1: RESUME SESSION ---
-    if msg.get('type') == 'resume_1':
-        print(f"  Processing 'resume_1' from {peer_id}...")
-        if not master_key:
-            print("  Peer wants to resume, but we have no key. Sending fail.")
-            fail_msg = {'type': 'resume_fail_no_key'}
-            send_secure_message(sock, json.dumps(fail_msg).encode())
-            return None, None
-            
-        nonce = base64.b64decode(msg['nonce'])
-        sig = base64.b64decode(msg['sig'])
-        data_to_verify = peer_id.encode() + nonce
-        
-        if not verify_signature(peer_rsa_pub, sig, data_to_verify):
-            print("[!] Peer's resume signature is INVALID! Aborting.")
-            return None, None
-            
-        print("  Peer signature verified. Sending resume_2 ACK.")
-        my_nonce = os.urandom(32)
-        my_data_to_sign = my_id.encode() + my_nonce
-        my_signature = sign_data(my_private_key, my_data_to_sign)
-        
-        resume_2 = {
-            'type': 'resume_2',
-            'id': my_id,
-            'nonce': base64.b64encode(my_nonce).decode('utf-8'),
-            'sig': base64.b64encode(my_signature).decode('utf-8')
-        }
-        send_secure_message(sock, json.dumps(resume_2).encode())
-        print("[+] Session Resumed!")
-        return master_key, peer_id # <-- RETURN MASTER KEY
-
+    # --- We no longer check for an existing key. ---
+    
+    # --- CASE 1: RESUME SESSION (REMOVED) ---
+    
     # --- CASE 2: FULL HANDSHAKE ---
-    elif msg.get('type') == 'handshake_1':
+    if msg.get('type') == 'handshake_1':
         print(f"  Processing 'handshake_1' from {peer_id}...")
         
         peer_ec_pub_bytes = base64.b64decode(msg['ec_pub_key'])
@@ -369,15 +276,8 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
         peer_ec_pub_key = serialization.load_pem_public_key(peer_ec_pub_bytes, default_backend())
         master_key = ec_private_key.exchange(ec.ECDH(), peer_ec_pub_key)
         
-        try:
-            conn = sqlite3.connect(DATABASE_FILE)
-            cursor = conn.cursor()
-            cursor.execute("UPDATE peers SET master_key = ? WHERE id = ?", (master_key, peer_id))
-            conn.commit()
-            conn.close()
-            print("  New Master Key computed and stored.")
-        except sqlite3.Error as e:
-            print(f"[!] SQLite error storing master key: {e}")
+        # --- We no longer store the master_key in the database ---
+        print("  New Master Key computed (in memory only).")
         
         data_to_sign = my_id.encode() + ec_pub_bytes
         signature = sign_data(my_private_key, data_to_sign)
@@ -694,7 +594,7 @@ def main_ui():
                         print(f"[+] Handshake with {peer_id} successful!")
                         # Pass the master_key to start_chat_session
                         start_chat_session(conn, master_key, peer_id, MY_PRIVATE_KEY)
-                        break 
+                        # No break here, allow main loop to continue after chat
                     else:
                         print("[-] Handshake failed. Closing connection.")
                         conn.close()
