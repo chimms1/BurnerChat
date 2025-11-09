@@ -19,6 +19,7 @@ from cryptography.exceptions import InvalidSignature
 MY_PORT = 42069
 INACTIVITY_TIMEOUT = 60.0
 DATABASE_FILE = 'chat_keys.db'
+REKEY_AFTER_MESSAGES = 10 # Re-key after 10 messages total (send/recv)
 
 # --- AES-128 Configuration ---
 AES_KEY_SIZE = 16
@@ -97,13 +98,19 @@ def verify_signature(public_key, signature, data):
     except InvalidSignature:
         return False
 
-def derive_session_key(master_key):
-    """Derives a 128-bit (16-byte) session key from the master key."""
+def derive_session_key(master_key, epoch):
+    """
+    Derives a 128-bit (16-byte) session key from the master key
+    for a specific epoch.
+    """
+    # We use the epoch in the 'info' field to ensure each derived key is unique
+    info_str = f'p2p-chat-epoch-{epoch}'.encode()
+    
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
         length=AES_KEY_SIZE,
         salt=None,
-        info=b'p2p-chat-session-key',
+        info=info_str,
         backend=default_backend()
     )
     return hkdf.derive(master_key)
@@ -205,7 +212,7 @@ def perform_handshake_initiator(sock, my_id, my_private_key, peer_id):
             sig_data = response['id'].encode() + base64.b64decode(response['nonce'])
             if verify_signature(peer_rsa_pub, base64.b64decode(response['sig']), sig_data):
                 print("[+] Session Resumed!")
-                return derive_session_key(master_key)
+                return master_key  # <-- RETURN MASTER KEY
             else:
                 print("[!] Resume ACK signature invalid! Aborting.")
                 return None
@@ -269,7 +276,7 @@ def perform_handshake_initiator(sock, my_id, my_private_key, peer_id):
     except sqlite3.Error as e:
         print(f"[!] SQLite error storing master key: {e}")
     
-    return derive_session_key(master_key)
+    return master_key # <-- RETURN MASTER KEY
 
 
 def perform_handshake_receiver(sock, my_id, my_private_key):
@@ -336,7 +343,7 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
         }
         send_secure_message(sock, json.dumps(resume_2).encode())
         print("[+] Session Resumed!")
-        return derive_session_key(master_key), peer_id
+        return master_key, peer_id # <-- RETURN MASTER KEY
 
     # --- CASE 2: FULL HANDSHAKE ---
     elif msg.get('type') == 'handshake_1':
@@ -384,7 +391,7 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
         send_secure_message(sock, json.dumps(handshake_2).encode())
         print("  Sent handshake_2.")
         
-        return derive_session_key(master_key), peer_id
+        return master_key, peer_id # <-- RETURN MASTER KEY
         
     else:
         print(f"[!] Unknown handshake message type: {msg.get('type')}")
@@ -412,14 +419,14 @@ def start_listener(my_ip, my_port):
     finally:
         s.close()
         
-# --- 5. The Chat Session (NOW Encrypted AND Signed) ---
+# --- 5. The Chat Session (NOW Encrypted, Signed, AND Ratcheting) ---
 
 stop_chat_thread = threading.Event()
 
-def receive_messages(sock, session_key, peer_public_key):
+def receive_messages(sock, chat_state, peer_public_key):
     """
     Target function for the receive thread.
-    Decrypts messages and *verifies signatures*.
+    Decrypts messages, verifies signatures, and handles re-keying.
     """
     global stop_chat_thread
     sock.settimeout(INACTIVITY_TIMEOUT)
@@ -432,24 +439,42 @@ def receive_messages(sock, session_key, peer_public_key):
             if not iv_and_ciphertext:
                 print("\n[!] Peer disconnected.")
                 break
+
+            # 2. Get the current key and state *atomically*
+            current_key_to_use = None
+            with chat_state['lock']:
+                # Increment shared counter
+                chat_state['count'] += 1
+                
+                # Check if it's time to re-key
+                if chat_state['count'] > REKEY_AFTER_MESSAGES:
+                    print(f"\n[!] ({REKEY_AFTER_MESSAGES} messages passed) RE-KEYING SESSION (Receive)...")
+                    chat_state['epoch'] += 1
+                    chat_state['session_key'] = derive_session_key(
+                        chat_state['master_key'], chat_state['epoch']
+                    )
+                    chat_state['count'] = 1 # This is message 1 of the new epoch
+                    print(f"[!] New session key for epoch {chat_state['epoch']} derived.")
+
+                current_key_to_use = chat_state['session_key']
             
-            # 2. Decrypt the payload to get the JSON string
-            message_json_str = decrypt_message(session_key, iv_and_ciphertext)
+            # 3. Decrypt the payload to get the JSON string
+            message_json_str = decrypt_message(current_key_to_use, iv_and_ciphertext)
             
-            # 3. Unpack the JSON
+            # 4. Unpack the JSON
             payload = json.loads(message_json_str)
             message_text = payload['msg']
             signature_b64 = payload['sig']
             
-            # 4. Verify the signature
+            # 5. Verify the signature
             signature_bytes = base64.b64decode(signature_b64)
             data_to_verify = message_text.encode('utf-8')
             
             if verify_signature(peer_public_key, signature_bytes, data_to_verify):
-                # 5. Display if valid
+                # 6. Display if valid
                 print(f"\rPeer: {message_text}      \nYou: ", end="")
             else:
-                # 5. Show error if invalid
+                # 6. Show error if invalid
                 print(f"\n[!] INVALID SIGNATURE received for message: '{message_text}'")
                 print("You: ", end="") # Re-draw prompt
 
@@ -464,7 +489,8 @@ def receive_messages(sock, session_key, peer_public_key):
             print("\n[!] Received malformed (non-JSON) message. Tampering suspected.")
             break
         except Exception as e:
-            print(f"\n[!] Decryption/Verification error: {e}. Possible key mismatch or tampered message.")
+            # This will catch decryption errors if keys go out of sync
+            print(f"\n[!] Decryption/Verification error: {e}. Keys may be out of sync.")
             break
             
     stop_chat_thread.set()
@@ -473,11 +499,10 @@ def receive_messages(sock, session_key, peer_public_key):
     except OSError:
         pass 
 
-def start_chat_session(conn, session_key, peer_id, my_private_key):
+def start_chat_session(conn, master_key, peer_id, my_private_key):
     """
     Manages an active 1-on-1 ENCRYPTED and SIGNED chat.
-    Passes peer_id to load public key for verification.
-    Passes my_private_key to sign outgoing messages.
+    Now manages a shared state for re-keying.
     """
     global stop_chat_thread
     stop_chat_thread.clear()
@@ -489,12 +514,21 @@ def start_chat_session(conn, session_key, peer_id, my_private_key):
         conn.close()
         return
 
-    print("\n--- SECURE & VERIFIED Chat Started! Type 'exit' to end. ---")
+    # Create the shared state object
+    chat_state = {
+        'lock': threading.Lock(),
+        'count': 0,                     # Shared message counter
+        'epoch': 1,                     # Key epoch
+        'master_key': master_key,       # Unchanging master key
+        'session_key': derive_session_key(master_key, 1) # Initial session key
+    }
 
-    # Start the receive thread, passing it the peer's public key
+    print(f"\n--- SECURE & VERIFIED Chat Started! (Re-keys every {REKEY_AFTER_MESSAGES} msgs) ---")
+
+    # Start the receive thread, passing it the shared state
     receiver = threading.Thread(
         target=receive_messages, 
-        args=(conn, session_key, peer_public_key), 
+        args=(conn, chat_state, peer_public_key), 
         daemon=True
     )
     receiver.start()
@@ -504,12 +538,31 @@ def start_chat_session(conn, session_key, peer_id, my_private_key):
         try:
             message_text = input("You: ")
             
+            if len(message_text.strip())==0:
+                continue
+                
             if stop_chat_thread.is_set():
                 print("[!] Connection is closed. Cannot send message.")
                 break
                 
             if message_text.lower() == 'exit':
                 break
+
+            current_key_to_use = None
+            # Atomically update counter and get current key
+            with chat_state['lock']:
+                chat_state['count'] += 1
+                
+                if chat_state['count'] > REKEY_AFTER_MESSAGES:
+                    print(f"\n[!] ({REKEY_AFTER_MESSAGES} messages passed) RE-KEYING SESSION (Send)...")
+                    chat_state['epoch'] += 1
+                    chat_state['session_key'] = derive_session_key(
+                        chat_state['master_key'], chat_state['epoch']
+                    )
+                    chat_state['count'] = 1 # This is message 1 of the new epoch
+                    print(f"[!] New session key for epoch {chat_state['epoch']} derived.")
+                
+                current_key_to_use = chat_state['session_key']
 
             # 1. Sign the message
             data_to_sign = message_text.encode('utf-8')
@@ -522,8 +575,9 @@ def start_chat_session(conn, session_key, peer_id, my_private_key):
             }
             message_json_str = json.dumps(payload)
 
-            # 3. Encrypt the JSON string
-            iv_and_ciphertext = encrypt_message(session_key, message_json_str)
+            # 3. Encrypt the JSON string using the key for this epoch
+            print("Message => {} current_key => {}".format(message_json_str, current_key_to_use))
+            iv_and_ciphertext = encrypt_message(current_key_to_use, message_json_str)
             
             # 4. Send securely (with length prefix)
             send_secure_message(conn, iv_and_ciphertext)
@@ -598,17 +652,18 @@ def main_ui():
                 client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 client_sock.connect((target_ip, MY_PORT))
                 
-                session_key = perform_handshake_initiator(
+                # Handshake now returns the master_key
+                master_key = perform_handshake_initiator(
                     client_sock, 
                     MY_ID, 
                     MY_PRIVATE_KEY, 
                     target_id
                 )
                 
-                if session_key:
+                if master_key:
                     print("[+] Handshake successful!")
-                    # Pass target_id and MY_PRIVATE_KEY to chat session
-                    start_chat_session(client_sock, session_key, target_id, MY_PRIVATE_KEY)
+                    # Pass the master_key to start_chat_session
+                    start_chat_session(client_sock, master_key, target_id, MY_PRIVATE_KEY)
                 else:
                     print("[-] Handshake failed. Connection closed.")
                     client_sock.close()
@@ -628,16 +683,17 @@ def main_ui():
                 print(f"\nProcessing incoming request from {addr[0]}...")
                 
                 try:
-                    session_key, peer_id = perform_handshake_receiver(
+                    # Handshake now returns master_key and peer_id
+                    master_key, peer_id = perform_handshake_receiver(
                         conn, 
                         MY_ID, 
                         MY_PRIVATE_KEY
                     )
                     
-                    if session_key and peer_id:
+                    if master_key and peer_id:
                         print(f"[+] Handshake with {peer_id} successful!")
-                        # Pass peer_id and MY_PRIVATE_KEY to chat session
-                        start_chat_session(conn, session_key, peer_id, MY_PRIVATE_KEY)
+                        # Pass the master_key to start_chat_session
+                        start_chat_session(conn, master_key, peer_id, MY_PRIVATE_KEY)
                         break 
                     else:
                         print("[-] Handshake failed. Closing connection.")
