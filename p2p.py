@@ -113,7 +113,12 @@ def derive_session_key(master_key, epoch):
         info=info_str,
         backend=default_backend()
     )
-    return hkdf.derive(master_key)
+    
+    res = hkdf.derive(master_key)
+    
+    print(" ===== Current session key: {} =======".format(res))
+    
+    return res
 
 def encrypt_message(session_key, message_str):
     """Encrypts a string with AES-128-CBC."""
@@ -476,7 +481,7 @@ def start_chat_session(conn, master_key, peer_id, my_private_key):
             message_json_str = json.dumps(payload)
 
             # 3. Encrypt the JSON string using the key for this epoch
-            print("Message => {} current_key => {}".format(message_json_str, current_key_to_use))
+            
             iv_and_ciphertext = encrypt_message(current_key_to_use, message_json_str)
             
             # 4. Send securely (with length prefix)
