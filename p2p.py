@@ -7,7 +7,7 @@ import json
 import base64
 import os
 import sqlite3
-import hmac # <-- Import hmac
+import hmac
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import rsa, ec, padding
 from cryptography.hazmat.primitives import serialization, hashes
@@ -24,7 +24,7 @@ from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey
 MY_PORT = 42069
 INACTIVITY_TIMEOUT = 600.0
 DATABASE_FILE = 'chat_keys.db'
-REKEY_AFTER_MESSAGES = 5 # Re-key after 5 messages on each chain
+CHANGEKEY_AFTER_MESSAGES = 5 # change key after 5 messages on each chain
 
 # --- AES-128 + HMAC-SHA256 Configuration ---
 AES_KEY_SIZE = 16
@@ -32,7 +32,7 @@ HMAC_KEY_SIZE = 32
 BUNDLE_KEY_SIZE = AES_KEY_SIZE + HMAC_KEY_SIZE # 16 + 32 = 48 bytes
 IV_SIZE = 16
 
-# Thread-safe queue for incoming connection requests
+# Queue for incoming connection requests
 connection_requests = queue.Queue()
 
 
@@ -40,7 +40,7 @@ def pretty_key(key):
     if key is None:
         return "None"
 
-    # EC Private Key -> serialize private key bytes (yes, we are showing it)
+    # EC Private Key -> serialize private key bytes
     if isinstance(key, EllipticCurvePrivateKey):
         key_bytes = key.private_bytes(
             encoding=serialization.Encoding.DER,
@@ -61,25 +61,16 @@ def pretty_key(key):
     if isinstance(key, (bytes, bytearray)):
         return f"{len(key)} bytes, starts with: {key[:4].hex()}..."
 
-    # Fallback for anything else
+    # Else
     try:
         return f"{len(key)} bytes (?)"
     except:
         return f"{repr(key)}"
 
 def log_chat_state(state, context_message):
-    """Prints a readable snapshot of the chat_state for debugging."""
     
-    # # Helper to make byte strings readable
-    # def pretty_key(key_bytes):
-    #     if not key_bytes:
-    #         return "None"
-    #     # Show length and first 4 bytes in hex
-    #     return f"{len(key_bytes)} bytes, starts with: {key_bytes[:4].hex()}..."
-
-    print(f"\n--- 🔎 CHAT STATE: {context_message} 🔎 ---")
+    print(f"\n--- CHAT STATE: {context_message} ---")
     try:
-        # We must acquire the lock to get a consistent snapshot
         with state['lock']:
             print(f"  Root Key       : {pretty_key(state['root_key'])}")
             print(f"  My DH Key      : {pretty_key(state['my_dh_key'])}")
@@ -93,14 +84,14 @@ def log_chat_state(state, context_message):
             print(f"  Msg Num (Recv) : {state['receiving_msg_num']}")
             print(f"  Key (Recv)     : {pretty_key(state['receiving_key'])}")
     except Exception as e:
-        print(f"  [!] Error while logging state: {e}")
+        print(f"  => !!  Error while logging state: {e}")
     print("-------------------------------------------\n")
 
 
 # --- 1. CRYPTOGRAPHIC HELPERS ---
 
 def load_my_private_key(my_id):
-    """Loads this user's RSA private key from their .pem file."""
+    
     filename = f"{my_id}.pem"
     try:
         with open(filename, "rb") as key_file:
@@ -110,12 +101,11 @@ def load_my_private_key(my_id):
                 backend=default_backend()
             )
     except FileNotFoundError:
-        print(f"[!] CRITICAL: Private key file not found: {filename}")
-        print("    Did you run setup_keys.py first? Or generate keys manually?")
+        print(f"=> !!  CRITICAL: Private key file not found: {filename}")
         sys.exit(1)
 
 def load_peer_public_key(peer_id):
-    """Loads a peer's RSA public key from the SQLite 'database'."""
+    
     try:
         conn = sqlite3.connect(DATABASE_FILE)
         cursor = conn.cursor()
@@ -130,18 +120,18 @@ def load_peer_public_key(peer_id):
                 backend=default_backend()
             )
         else:
-            print(f"[!] No public key found in database for ID: {peer_id}")
+            print(f"=> !!  No public key found in database for ID: {peer_id}")
             return None
             
     except sqlite3.Error as e:
-        print(f"[!] SQLite error while loading public key: {e}")
+        print(f"=> !!  SQLite error while loading public key: {e}")
         return None
     except KeyError:
-        print(f"[!] No public key found in database for ID: {peer_id}")
+        print(f"=> !!  No public key found in database for ID: {peer_id}")
         return None
 
 def sign_data(private_key, data):
-    """Signs data with our RSA private key."""
+    
     return private_key.sign(
         data,
         padding.PSS(
@@ -152,7 +142,7 @@ def sign_data(private_key, data):
     )
 
 def verify_signature(public_key, signature, data):
-    """Verifies a signature using a peer's RSA public key."""
+    
     try:
         public_key.verify(
             signature,
@@ -168,9 +158,7 @@ def verify_signature(public_key, signature, data):
         return False
 
 def kdf_derive_key(key_material, info_str, length):
-    """
-    General-purpose KDF to derive a new key of arbitrary length.
-    """
+    
     info_bytes = info_str.encode()
     
     hkdf = HKDF(
@@ -183,23 +171,19 @@ def kdf_derive_key(key_material, info_str, length):
     return hkdf.derive(key_material)
 
 def generate_hmac(hmac_key, data):
-    """Generates a HMAC-SHA256 tag."""
-    # The fix is changing hashes.SHA256() to the string "sha256"
+    
     h = hmac.new(hmac_key, data, "sha256")
     return h.digest()
 
 def verify_hmac(hmac_key, tag, data):
-    """Verifies a HMAC-SHA256 tag in constant time."""
     
-    # 1. Generate the HMAC we *expect* to see based on the data
     h = hmac.new(hmac_key, data, "sha256")
     expected_tag = h.digest()
     
-    # 2. Securely compare the expected tag with the received tag
     return hmac.compare_digest(expected_tag, tag)
 
 def encrypt_message(session_key, message_str):
-    """Encrypts a string with AES-128-CBC."""
+    
     iv = os.urandom(IV_SIZE)
     cipher = Cipher(algorithms.AES(session_key), modes.CBC(iv), backend=default_backend())
     encryptor = cipher.encryptor()
@@ -211,7 +195,7 @@ def encrypt_message(session_key, message_str):
     return iv + ciphertext
 
 def decrypt_message(session_key, iv_and_ciphertext):
-    """Decrypts an AES-128-CBC message (IV + Ciphertext)."""
+    
     iv = iv_and_ciphertext[:IV_SIZE]
     ciphertext = iv_and_ciphertext[IV_SIZE:]
     
@@ -225,17 +209,18 @@ def decrypt_message(session_key, iv_and_ciphertext):
     
     return data.decode('utf-8')
 
-# --- 2. SECURE SOCKET HELPERS (Length-Prefixed) ---
+# --- 2. SECURE SOCKET HELPERS ---
 def send_secure_message(sock, payload_bytes):
-    """Prefixes a message with its 4-byte length and sends it."""
+    
     try:
         msg_len = len(payload_bytes).to_bytes(4, 'big')
         sock.sendall(msg_len + payload_bytes)
     except (OSError, ConnectionResetError) as e:
-        print(f"[!] Error sending message: {e}")
+        print(f"=> !!  Error sending message: {e}")
         raise 
+    
 def recv_secure_message(sock):
-    """Reads a 4-byte length prefix, then receives a full message."""
+    
     try:
         len_bytes = sock.recv(4)
         if not len_bytes:
@@ -248,12 +233,9 @@ def recv_secure_message(sock):
     except (OSError, ConnectionResetError):
         return None
         
-# --- 3. HANDSHAKE LOGIC (Modified to return DH keys) ---
+# --- 3. HANDSHAKES ---
 def perform_handshake_initiator(sock, my_id, my_private_key, peer_id):
-    """
-    Initiator side of the handshake.
-    Returns: (master_key, my_ec_private_key, peer_ec_public_key) or (None, None, None)
-    """
+
     print(f"--- Initiating handshake with {peer_id} ---")
     
     print("  Performing full ECDHE handshake...")
@@ -283,7 +265,7 @@ def perform_handshake_initiator(sock, my_id, my_private_key, peer_id):
     response = json.loads(response_bytes.decode())
     
     if response.get('type') != 'handshake_2' or response.get('id') != peer_id:
-        print("[!] Invalid handshake_2 response. Aborting.")
+        print("=> !!  Invalid handshake_2 response. Aborting.")
         return None, None, None
         
     peer_ec_pub_bytes = base64.b64decode(response['ec_pub_key'])
@@ -293,7 +275,7 @@ def perform_handshake_initiator(sock, my_id, my_private_key, peer_id):
     data_to_verify = response['id'].encode() + peer_ec_pub_bytes
     
     if not verify_signature(peer_rsa_pub, peer_sig, data_to_verify):
-        print("[!] Peer's handshake signature is INVALID! Aborting.")
+        print("=> !!  Peer's handshake signature is INVALID! Aborting.")
         return None, None, None
         
     print("  Peer signature verified.")
@@ -303,14 +285,10 @@ def perform_handshake_initiator(sock, my_id, my_private_key, peer_id):
     
     print("  New Master Key computed (in memory only).")
     
-    # RETURN a tuple of all 3 critical items
     return master_key, ec_private_key, peer_ec_pub_key
 
 def perform_handshake_receiver(sock, my_id, my_private_key):
-    """
-    Receiver side of the handshake.
-    Returns: (master_key, peer_id, my_ec_private_key, peer_ec_public_key) or (None, None, None, None)
-    """
+    
     print("--- Awaiting handshake ---")
     
     msg_bytes = recv_secure_message(sock)
@@ -322,13 +300,13 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
     peer_id = msg.get('id')
     
     if not peer_id:
-        print("[!] Handshake message has no ID. Aborting.")
+        print("=> !!  Handshake message has no ID. Aborting.")
         return None, None, None, None
         
     print(f"  Handshake attempt from {peer_id}.")
     peer_rsa_pub = load_peer_public_key(peer_id)
     if not peer_rsa_pub:
-        print(f"[!] Unknown peer ID: {peer_id}. Aborting.")
+        print(f"=> !!  Unknown peer ID: {peer_id}. Aborting.")
         return None, None, None, None
         
     if msg.get('type') == 'handshake_1':
@@ -339,7 +317,7 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
         data_to_verify = peer_id.encode() + peer_ec_pub_bytes
         
         if not verify_signature(peer_rsa_pub, peer_sig, data_to_verify):
-            print("[!] Peer's handshake signature is INVALID! Aborting.")
+            print("=> !!  Peer's handshake signature is INVALID! Aborting.")
             return None, None, None, None
         
         print("  Peer signature verified.")
@@ -368,16 +346,15 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
         send_secure_message(sock, json.dumps(handshake_2).encode())
         print("  Sent handshake_2.")
         
-        # RETURN a tuple of all 4 critical items
         return master_key, peer_id, ec_private_key, peer_ec_pub_key
         
     else:
-        print(f"[!] Unknown handshake message type: {msg.get('type')}")
+        print(f"=> !!  Unknown handshake message type: {msg.get('type')}")
         return None, None, None, None
 
-# --- 4. The Listener Thread (Unchanged) ---
+# --- 4. Listener Thread ---
 def start_listener(my_ip, my_port):
-    """Listens for incoming connections and puts them in a queue."""
+    
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     
@@ -387,21 +364,19 @@ def start_listener(my_ip, my_port):
         print(f"[*] Listening on {my_ip}:{my_port}")
         while True:
             conn, addr = s.accept()
-            print(f"\n[!] Incoming connection from {addr[0]}")
+            print(f"\n=> !!  Incoming connection from {addr[0]}")
             connection_requests.put((conn, addr))
             
     except OSError as e:
-        print(f"[!] Listener socket error: {e}")
+        print(f"=> !!  Listener socket error: {e}")
     finally:
         s.close()
             
-# --- 5. The Chat Session (Dual Ratchet Logic) ---
+            
 stop_chat_thread = threading.Event()
+
 def receive_messages(sock, chat_state):
-    """
-    Target function for the receive thread.
-    Manages the RECEIVING chain key and DH ratchet updates.
-    """
+    
     global stop_chat_thread
     sock.settimeout(INACTIVITY_TIMEOUT)
     
@@ -410,7 +385,7 @@ def receive_messages(sock, chat_state):
             iv_and_ciphertext = recv_secure_message(sock)
             
             if not iv_and_ciphertext:
-                print("\n[!] Peer disconnected.")
+                print("\n=> !!  Peer disconnected.")
                 break
             
             # 1. Get current receiving key bundle
@@ -430,7 +405,7 @@ def receive_messages(sock, chat_state):
             
             # 3. Verify HMAC
             if not verify_hmac(hmac_key, hmac_tag, payload_json_str.encode('utf-8')):
-                print("\n[!] INVALID HMAC! Message discarded. Tampering suspected.")
+                print("\n=> !!  INVALID HMAC! Message discarded. Tampering suspected.")
                 print("You: ", end="") # Re-draw prompt
                 continue
                 
@@ -438,13 +413,13 @@ def receive_messages(sock, chat_state):
             payload = json.loads(payload_json_str)
             message_text = payload['msg']
             msg_num = payload['msg_num']
-            peer_dh_pub_key_b64 = payload.get('dh_pub_key') # This will be present on re-key
+            peer_dh_pub_key_b64 = payload.get('dh_pub_key') # This will be present on change key
             
             # 5. Acquire lock to update state
             with chat_state['lock']:
                 # Check for out-of-order messages
                 if msg_num <= chat_state['receiving_msg_num']:
-                    print(f"\n[!] Received out-of-order message (Num: {msg_num}). Discarding.")
+                    print(f"\n=> !!  Received out-of-order message (Num: {msg_num}). Discarding.")
                     print("You: ", end="") # Re-draw prompt
                     continue
                     
@@ -452,7 +427,7 @@ def receive_messages(sock, chat_state):
                 
                 # Check if this message is triggering a DH ratchet step
                 if peer_dh_pub_key_b64:
-                    print(f"\n[!] ({REKEY_AFTER_MESSAGES} msgs received) RE-KEYING (DH Ratchet)...")
+                    print(f"\n=> !!  ({CHANGEKEY_AFTER_MESSAGES} msgs received) Changing Keys (DH Ratchet)...")
                     
                     # Load the peer's new public key
                     peer_dh_pub_bytes = base64.b64decode(peer_dh_pub_key_b64)
@@ -480,28 +455,26 @@ def receive_messages(sock, chat_state):
                     chat_state['sending_msg_num'] = 0
                     chat_state['receiving_msg_num'] = 0 # This message was #5 (or #10, etc)
                     
-                    print(f"[!] New Root Key and Chain Keys derived.")
+                    print(f"=> !!  New Root Key and Chain Keys derived.")
                 
-            
-            # 6. Finally, print the message
             
             log_chat_state(chat_state, f"After processing msg #{msg_num} from peer")
             
             print(f"\rPeer: {message_text}      \nYou: ", end="")
             
         except socket.timeout:
-            print(f"\n[!] Chat timed out after {INACTIVITY_TIMEOUT}s of inactivity.")
+            print(f"\n=> !!  Chat timed out after {INACTIVITY_TIMEOUT}s of inactivity.")
             break
         except (OSError, ConnectionResetError):
             if not stop_chat_thread.is_set():
-                print("\n[!] Connection error in receive thread.")
+                print("\n=> !!  Connection error in receive thread.")
             break
         except json.JSONDecodeError:
-            print("\n[!] Received malformed (non-JSON) message. Tampering suspected.")
+            print("\n=> !!  Received malformed (non-JSON) message. Tampering suspected.")
             break
         except Exception as e:
             # This will catch decryption errors if keys go out of sync
-            print(f"\n[!] Decryption/Verification error: {e}. Keys may be out of sync.")
+            print(f"\n=> !!  Decryption/Verification error: {e}. Keys may be out of sync.")
             break
             
     stop_chat_thread.set()
@@ -541,11 +514,11 @@ def start_chat_session(conn, master_key, my_dh_key, peer_dh_pub_key, am_i_initia
         'receiving_key': initial_receiving_key, # 48-byte bundle (AES+HMAC)
         'receiving_msg_num': 0,
         
-        'send_info': send_info, # Store for re-keying
-        'recv_info': recv_info  # Store for re-keying
+        'send_info': send_info,
+        'recv_info': recv_info
     }
     
-    print(f"\n--- SECURE Ratchet Chat Started! (Re-keys every {REKEY_AFTER_MESSAGES} msgs) ---")
+    print(f"\n--- SECURE Chat Started! (Change Keys every {CHANGEKEY_AFTER_MESSAGES} msgs) ---")
     
     # Start the receive thread
     receiver = threading.Thread(
@@ -567,7 +540,7 @@ def start_chat_session(conn, master_key, my_dh_key, peer_dh_pub_key, am_i_initia
                 continue
                     
             if stop_chat_thread.is_set():
-                print("[!] Connection is closed. Cannot send message.")
+                print("=> !!  Connection is closed. Cannot send message.")
                 break
                         
             if message_text.lower() == 'exit':
@@ -577,7 +550,6 @@ def start_chat_session(conn, master_key, my_dh_key, peer_dh_pub_key, am_i_initia
             current_msg_num = 0
             dh_pub_bytes_to_send = None # This is the NEW pubkey to attach
 
-            # --- *** THIS IS THE CORRECTED RATCHET LOGIC *** ---
             with chat_state['lock']:
                 # 1. Increment message number
                 chat_state['sending_msg_num'] += 1
@@ -587,8 +559,8 @@ def start_chat_session(conn, master_key, my_dh_key, peer_dh_pub_key, am_i_initia
                 current_send_bundle = chat_state['sending_key'] 
                 
                 # 3. Check if it's time to ratchet *after* this message.
-                if current_msg_num == REKEY_AFTER_MESSAGES:
-                    print(f"\n[!] ({REKEY_AFTER_MESSAGES} msgs sent) RE-KEYING (DH Ratchet)...")
+                if current_msg_num == CHANGEKEY_AFTER_MESSAGES:
+                    print(f"\n=> !!  ({CHANGEKEY_AFTER_MESSAGES} msgs sent) Changing Keys (DH Ratchet)...")
                     
                     # A. Generate our *new* DH key pair
                     new_my_dh_key = ec.generate_private_key(ec.SECP384R1(), default_backend())
@@ -618,13 +590,10 @@ def start_chat_session(conn, master_key, my_dh_key, peer_dh_pub_key, am_i_initia
                     chat_state['sending_msg_num'] = 0
                     chat_state['receiving_msg_num'] = 0
                     
-                    print(f"[!] New Root Key and Chain Keys derived. Attaching new PubKey to message.")
-
-                # The buggy "if current_msg_num > REKEY_AFTER_MESSAGES:" block is removed.
+                    print(f"=> !!  New Root Key and Chain Keys derived. Attaching new PubKey to message.")
             
             # --- End of lock ---
             
-            # 4. Split the key bundle (This is the OLD key, as intended)
             aes_key = current_send_bundle[:AES_KEY_SIZE]
             hmac_key = current_send_bundle[AES_KEY_SIZE:]
             
@@ -658,7 +627,7 @@ def start_chat_session(conn, master_key, my_dh_key, peer_dh_pub_key, am_i_initia
         except (EOFError, KeyboardInterrupt):
             break
         except (OSError, ConnectionResetError):
-            print("[!] Connection closed.")
+            print("=> !!  Connection closed.")
             break
             
     stop_chat_thread.set()
@@ -674,7 +643,7 @@ def start_chat_session(conn, master_key, my_dh_key, peer_dh_pub_key, am_i_initia
             pass
         conn.close()
         
-# --- 6. The Main (UI) Thread (Modified to pass DH keys) ---
+        
 def main_ui():
     """The main user-facing loop."""
     
@@ -747,9 +716,9 @@ def main_ui():
                     client_sock.close()
                     
             except (socket.error, ConnectionRefusedError) as e:
-                print(f"[!] Connection failed: {e}")
+                print(f"=> !!  Connection failed: {e}")
             except Exception as e:
-                print(f"[!] An error occurred during connection: {e}")
+                print(f"=> !!  An error occurred during connection: {e}")
                 if 'client_sock' in locals():
                     client_sock.close()
                     
@@ -783,7 +752,7 @@ def main_ui():
                         conn.close()
                 
                 except Exception as e:
-                    print(f"[!] An error occurred during handshake: {e}")
+                    print(f"=> !!  An error occurred during handshake: {e}")
                     conn.close()
             
         elif choice == '3':
@@ -794,7 +763,6 @@ def main_ui():
         else:
             print("Invalid choice.")
 
-# --- Run the application ---
 if __name__ == "__main__":
     try:
         main_ui()
