@@ -16,9 +16,13 @@ from cryptography.hazmat.primitives.padding import PKCS7
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.exceptions import InvalidSignature
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey, EllipticCurvePublicKey
+
+
 # --- Configuration ---
 MY_PORT = 42069
-INACTIVITY_TIMEOUT = 120.0
+INACTIVITY_TIMEOUT = 600.0
 DATABASE_FILE = 'chat_keys.db'
 REKEY_AFTER_MESSAGES = 5 # Re-key after 5 messages on each chain
 
@@ -30,6 +34,68 @@ IV_SIZE = 16
 
 # Thread-safe queue for incoming connection requests
 connection_requests = queue.Queue()
+
+
+def pretty_key(key):
+    if key is None:
+        return "None"
+
+    # EC Private Key -> serialize private key bytes (yes, we are showing it)
+    if isinstance(key, EllipticCurvePrivateKey):
+        key_bytes = key.private_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+        return f"EC PrivateKey [{len(key_bytes)} bytes, starts with: {key_bytes[:4].hex()}...]"
+
+    # EC Public Key
+    if isinstance(key, EllipticCurvePublicKey):
+        key_bytes = key.public_bytes(
+            encoding=serialization.Encoding.X962,
+            format=serialization.PublicFormat.UncompressedPoint
+        )
+        return f"EC PublicKey [{len(key_bytes)} bytes, starts with: {key_bytes[:4].hex()}...]"
+
+    # Raw bytes
+    if isinstance(key, (bytes, bytearray)):
+        return f"{len(key)} bytes, starts with: {key[:4].hex()}..."
+
+    # Fallback for anything else
+    try:
+        return f"{len(key)} bytes (?)"
+    except:
+        return f"{repr(key)}"
+
+def log_chat_state(state, context_message):
+    """Prints a readable snapshot of the chat_state for debugging."""
+    
+    # # Helper to make byte strings readable
+    # def pretty_key(key_bytes):
+    #     if not key_bytes:
+    #         return "None"
+    #     # Show length and first 4 bytes in hex
+    #     return f"{len(key_bytes)} bytes, starts with: {key_bytes[:4].hex()}..."
+
+    print(f"\n--- 🔎 CHAT STATE: {context_message} 🔎 ---")
+    try:
+        # We must acquire the lock to get a consistent snapshot
+        with state['lock']:
+            print(f"  Root Key       : {pretty_key(state['root_key'])}")
+            print(f"  My DH Key      : {pretty_key(state['my_dh_key'])}")
+            print(f"  Peer DH Key    : {pretty_key(state['peer_dh_pub_key'])}")
+            print(f"  Send Info      : {state['send_info']}")
+            print(f"  Recv Info      : {state['recv_info']}")
+            print(f"  -- Sending Chain --")
+            print(f"  Msg Num (Send) : {state['sending_msg_num']}")
+            print(f"  Key (Send)     : {pretty_key(state['sending_key'])}")
+            print(f"  -- Receiving Chain --")
+            print(f"  Msg Num (Recv) : {state['receiving_msg_num']}")
+            print(f"  Key (Recv)     : {pretty_key(state['receiving_key'])}")
+    except Exception as e:
+        print(f"  [!] Error while logging state: {e}")
+    print("-------------------------------------------\n")
+
 
 # --- 1. CRYPTOGRAPHIC HELPERS ---
 
@@ -124,13 +190,13 @@ def generate_hmac(hmac_key, data):
 
 def verify_hmac(hmac_key, tag, data):
     """Verifies a HMAC-SHA256 tag in constant time."""
-    try:
-        # The fix is changing hashes.SHA256() to the string "sha256"
-        h = hmac.new(hmac_key, data, "sha256")
-        h.verify(tag)
-        return True
-    except InvalidSignature:
-        return False
+    
+    # 1. Generate the HMAC we *expect* to see based on the data
+    h = hmac.new(hmac_key, data, "sha256")
+    expected_tag = h.digest()
+    
+    # 2. Securely compare the expected tag with the received tag
+    return hmac.compare_digest(expected_tag, tag)
 
 def encrypt_message(session_key, message_str):
     """Encrypts a string with AES-128-CBC."""
@@ -416,7 +482,11 @@ def receive_messages(sock, chat_state):
                     
                     print(f"[!] New Root Key and Chain Keys derived.")
                 
+            
             # 6. Finally, print the message
+            
+            log_chat_state(chat_state, f"After processing msg #{msg_num} from peer")
+            
             print(f"\rPeer: {message_text}      \nYou: ", end="")
             
         except socket.timeout:
@@ -488,6 +558,9 @@ def start_chat_session(conn, master_key, my_dh_key, peer_dh_pub_key, am_i_initia
     # Use the main thread for sending
     while not stop_chat_thread.is_set():
         try:
+            
+            log_chat_state(chat_state, "Ready to send (before input)")
+            
             message_text = input("You: ")
             
             if len(message_text.strip())==0:
@@ -502,117 +575,84 @@ def start_chat_session(conn, master_key, my_dh_key, peer_dh_pub_key, am_i_initia
             
             current_send_bundle = None
             current_msg_num = 0
-            dh_pub_bytes_to_send = None
-            
-            # Atomically update counter and check for re-key
+            dh_pub_bytes_to_send = None # This is the NEW pubkey to attach
+
+            # --- *** THIS IS THE CORRECTED RATCHET LOGIC *** ---
             with chat_state['lock']:
+                # 1. Increment message number
                 chat_state['sending_msg_num'] += 1
                 current_msg_num = chat_state['sending_msg_num']
+
+                # 2. Get the key for *this* message. This is ALWAYS the current (old) key.
+                current_send_bundle = chat_state['sending_key'] 
                 
-                # Check if it's time to re-key the SENDING chain
+                # 3. Check if it's time to ratchet *after* this message.
                 if current_msg_num == REKEY_AFTER_MESSAGES:
                     print(f"\n[!] ({REKEY_AFTER_MESSAGES} msgs sent) RE-KEYING (DH Ratchet)...")
                     
-                    # 1. Generate our *new* DH key pair
+                    # A. Generate our *new* DH key pair
                     new_my_dh_key = ec.generate_private_key(ec.SECP384R1(), default_backend())
                     new_my_dh_pub = new_my_dh_key.public_key()
+                    
+                    # B. This is the pubkey we will attach to the *current* message
                     dh_pub_bytes_to_send = new_my_dh_pub.public_bytes(
                         encoding=serialization.Encoding.PEM,
                         format=serialization.PublicFormat.SubjectPublicKeyInfo
                     )
                     
-                    # 2. Get peer's *current* public key
+                    # C. Get peer's *current* public key
                     current_peer_dh_pub = chat_state['peer_dh_pub_key']
                     
-                    # 3. Calculate new root key
+                    # D. Calculate new root key
                     new_root_key = new_my_dh_key.exchange(ec.ECDH(), current_peer_dh_pub)
                     
-                    # 4. Update state *immediately*
+                    # E. Update state *for the next message*
                     chat_state['root_key'] = new_root_key
                     chat_state['my_dh_key'] = new_my_dh_key # Our private key is updated
-                    # Note: peer_dh_pub_key is NOT updated yet.
                     
-                    # 5. Derive new chain keys
+                    # F. Derive new chain keys *for the next message*
                     chat_state['sending_key'] = kdf_derive_key(new_root_key, send_info, BUNDLE_KEY_SIZE)
                     chat_state['receiving_key'] = kdf_derive_key(new_root_key, recv_info, BUNDLE_KEY_SIZE)
                     
-                    # 6. Reset counters
+                    # G. Reset counters
                     chat_state['sending_msg_num'] = 0
                     chat_state['receiving_msg_num'] = 0
                     
                     print(f"[!] New Root Key and Chain Keys derived. Attaching new PubKey to message.")
-                
-                # Get the key to use for *this* message
-                # Note: If we re-keyed, we use the *old* key for this message
-                # This is "Encrypt-then-Ratchet"
-                # ... actually, that's complex. Let's use the new key right away.
-                # The logic above already updated chat_state['sending_key']
-                
-                # Re-reading... no, the logic above ONLY runs if msg_num == REKEY...
-                # Let's re-think. This is the race condition.
-                
-                # --- Let's try the "Ratchet-then-Encrypt" model ---
-                # The logic in the lock is fine. If we rekeyed, chat_state['sending_key']
-                # is *already* the new key.
-                
-                # Let's fix the counter.
-                if current_msg_num > REKEY_AFTER_MESSAGES:
-                    # This is message #6. It needs to be message #1.
-                    chat_state['sending_msg_num'] = 1
-                    current_msg_num = 1
-                    
-                    print(f"\n[!] ({REKEY_AFTER_MESSAGES} msgs sent) RE-KEYING (DH Ratchet)...")
-                    new_my_dh_key = ec.generate_private_key(ec.SECP384R1(), default_backend())
-                    new_my_dh_pub = new_my_dh_key.public_key()
-                    dh_pub_bytes_to_send = new_my_dh_pub.public_bytes(
-                        encoding=serialization.Encoding.PEM,
-                        format=serialization.PublicFormat.SubjectPublicKeyInfo
-                    )
-                    
-                    current_peer_dh_pub = chat_state['peer_dh_pub_key']
-                    new_root_key = new_my_dh_key.exchange(ec.ECDH(), current_peer_dh_pub)
-                    
-                    chat_state['root_key'] = new_root_key
-                    chat_state['my_dh_key'] = new_my_dh_key
-                    
-                    chat_state['sending_key'] = kdf_derive_key(new_root_key, send_info, BUNDLE_KEY_SIZE)
-                    chat_state['receiving_key'] = kdf_derive_key(new_root_key, recv_info, BUNDLE_KEY_SIZE)
-                    
-                    chat_state['receiving_msg_num'] = 0 # Reset receiving counter
-                    print(f"[!] New Root Key and Chain Keys derived. Attaching new PubKey to message.")
-                
-                current_send_bundle = chat_state['sending_key']
+
+                # The buggy "if current_msg_num > REKEY_AFTER_MESSAGES:" block is removed.
             
             # --- End of lock ---
             
-            # 1. Split the key bundle
+            # 4. Split the key bundle (This is the OLD key, as intended)
             aes_key = current_send_bundle[:AES_KEY_SIZE]
             hmac_key = current_send_bundle[AES_KEY_SIZE:]
             
-            # 2. Package inner payload
+            # 5. Package inner payload
             payload = {
                 'msg': message_text,
                 'msg_num': current_msg_num
             }
+            # Attach the *new* DH key if we generated one
             if dh_pub_bytes_to_send:
                 payload['dh_pub_key'] = base64.b64encode(dh_pub_bytes_to_send).decode('utf-8')
                 
             payload_json_str = json.dumps(payload)
             
-            # 3. Create HMAC
+            # 6. Create HMAC
             hmac_tag = generate_hmac(hmac_key, payload_json_str.encode('utf-8'))
             
-            # 4. Package outer payload
+            # 7. Package outer payload
             final_payload = {
                 'p': payload_json_str, # 'p' for payload
                 'hmac': base64.b64encode(hmac_tag).decode('utf-8')
             }
             final_json_str = json.dumps(final_payload)
             
-            # 5. Encrypt the outer payload
+            # 8. Encrypt the outer payload (with the OLD key)
             iv_and_ciphertext = encrypt_message(aes_key, final_json_str)
             
-            # 6. Send securely
+            # 9. Send securely
             send_secure_message(conn, iv_and_ciphertext)
             
         except (EOFError, KeyboardInterrupt):
@@ -633,7 +673,7 @@ def start_chat_session(conn, master_key, my_dh_key, peer_dh_pub_key, am_i_initia
         except OSError:
             pass
         conn.close()
-
+        
 # --- 6. The Main (UI) Thread (Modified to pass DH keys) ---
 def main_ui():
     """The main user-facing loop."""
