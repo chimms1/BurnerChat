@@ -118,13 +118,15 @@ def kdf_derive_key(key_material, info_str, length):
 
 def generate_hmac(hmac_key, data):
     """Generates a HMAC-SHA256 tag."""
-    h = hmac.new(hmac_key, data, hashes.SHA256())
+    # The fix is changing hashes.SHA256() to the string "sha256"
+    h = hmac.new(hmac_key, data, "sha256")
     return h.digest()
 
 def verify_hmac(hmac_key, tag, data):
     """Verifies a HMAC-SHA256 tag in constant time."""
     try:
-        h = hmac.new(hmac_key, data, hashes.SHA256())
+        # The fix is changing hashes.SHA256() to the string "sha256"
+        h = hmac.new(hmac_key, data, "sha256")
         h.verify(tag)
         return True
     except InvalidSignature:
