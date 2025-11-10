@@ -7,6 +7,7 @@ import json
 import base64
 import os
 import sqlite3
+import hmac # <-- Import hmac
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import rsa, ec, padding
 from cryptography.hazmat.primitives import serialization, hashes
@@ -17,12 +18,14 @@ from cryptography.exceptions import InvalidSignature
 
 # --- Configuration ---
 MY_PORT = 42069
-INACTIVITY_TIMEOUT = 60.0
+INACTIVITY_TIMEOUT = 120.0
 DATABASE_FILE = 'chat_keys.db'
 REKEY_AFTER_MESSAGES = 5 # Re-key after 5 messages on each chain
 
-# --- AES-128 Configuration ---
+# --- AES-128 + HMAC-SHA256 Configuration ---
 AES_KEY_SIZE = 16
+HMAC_KEY_SIZE = 32
+BUNDLE_KEY_SIZE = AES_KEY_SIZE + HMAC_KEY_SIZE # 16 + 32 = 48 bytes
 IV_SIZE = 16
 
 # Thread-safe queue for incoming connection requests
@@ -98,21 +101,34 @@ def verify_signature(public_key, signature, data):
     except InvalidSignature:
         return False
 
-def kdf_chain_step(key_material, info_str):
+def kdf_derive_key(key_material, info_str, length):
     """
-    General-purpose KDF to derive a new 16-byte (AES-128) key.
-    Used for deriving initial keys and for ratcheting.
+    General-purpose KDF to derive a new key of arbitrary length.
     """
     info_bytes = info_str.encode()
     
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
-        length=AES_KEY_SIZE,
+        length=length,
         salt=None,
         info=info_bytes,
         backend=default_backend()
     )
     return hkdf.derive(key_material)
+
+def generate_hmac(hmac_key, data):
+    """Generates a HMAC-SHA256 tag."""
+    h = hmac.new(hmac_key, data, hashes.SHA256())
+    return h.digest()
+
+def verify_hmac(hmac_key, tag, data):
+    """Verifies a HMAC-SHA256 tag in constant time."""
+    try:
+        h = hmac.new(hmac_key, data, hashes.SHA256())
+        h.verify(tag)
+        return True
+    except InvalidSignature:
+        return False
 
 def encrypt_message(session_key, message_str):
     """Encrypts a string with AES-128-CBC."""
@@ -142,7 +158,6 @@ def decrypt_message(session_key, iv_and_ciphertext):
     return data.decode('utf-8')
 
 # --- 2. SECURE SOCKET HELPERS (Length-Prefixed) ---
-
 def send_secure_message(sock, payload_bytes):
     """Prefixes a message with its 4-byte length and sends it."""
     try:
@@ -151,7 +166,6 @@ def send_secure_message(sock, payload_bytes):
     except (OSError, ConnectionResetError) as e:
         print(f"[!] Error sending message: {e}")
         raise 
-
 def recv_secure_message(sock):
     """Reads a 4-byte length prefix, then receives a full message."""
     try:
@@ -166,10 +180,12 @@ def recv_secure_message(sock):
     except (OSError, ConnectionResetError):
         return None
         
-# --- 3. HANDSHAKE LOGIC (Unchanged from previous step) ---
-
+# --- 3. HANDSHAKE LOGIC (Modified to return DH keys) ---
 def perform_handshake_initiator(sock, my_id, my_private_key, peer_id):
-    """Initiator side of the handshake. Always performs full ECDHE."""
+    """
+    Initiator side of the handshake.
+    Returns: (master_key, my_ec_private_key, peer_ec_public_key) or (None, None, None)
+    """
     print(f"--- Initiating handshake with {peer_id} ---")
     
     print("  Performing full ECDHE handshake...")
@@ -194,13 +210,13 @@ def perform_handshake_initiator(sock, my_id, my_private_key, peer_id):
     response_bytes = recv_secure_message(sock)
     if not response_bytes:
         print("  Peer disconnected during handshake.")
-        return None
+        return None, None, None
         
     response = json.loads(response_bytes.decode())
     
     if response.get('type') != 'handshake_2' or response.get('id') != peer_id:
         print("[!] Invalid handshake_2 response. Aborting.")
-        return None
+        return None, None, None
         
     peer_ec_pub_bytes = base64.b64decode(response['ec_pub_key'])
     peer_sig = base64.b64decode(response['sig'])
@@ -210,7 +226,7 @@ def perform_handshake_initiator(sock, my_id, my_private_key, peer_id):
     
     if not verify_signature(peer_rsa_pub, peer_sig, data_to_verify):
         print("[!] Peer's handshake signature is INVALID! Aborting.")
-        return None
+        return None, None, None
         
     print("  Peer signature verified.")
     
@@ -219,30 +235,33 @@ def perform_handshake_initiator(sock, my_id, my_private_key, peer_id):
     
     print("  New Master Key computed (in memory only).")
     
-    return master_key # <-- RETURN MASTER KEY
-
+    # RETURN a tuple of all 3 critical items
+    return master_key, ec_private_key, peer_ec_pub_key
 
 def perform_handshake_receiver(sock, my_id, my_private_key):
-    """Receiver side of the handshake. Always performs full ECDHE."""
+    """
+    Receiver side of the handshake.
+    Returns: (master_key, peer_id, my_ec_private_key, peer_ec_public_key) or (None, None, None, None)
+    """
     print("--- Awaiting handshake ---")
     
     msg_bytes = recv_secure_message(sock)
     if not msg_bytes:
         print("  Peer disconnected before handshake.")
-        return None, None
+        return None, None, None, None
         
     msg = json.loads(msg_bytes.decode())
     peer_id = msg.get('id')
     
     if not peer_id:
         print("[!] Handshake message has no ID. Aborting.")
-        return None, None
+        return None, None, None, None
         
     print(f"  Handshake attempt from {peer_id}.")
     peer_rsa_pub = load_peer_public_key(peer_id)
     if not peer_rsa_pub:
         print(f"[!] Unknown peer ID: {peer_id}. Aborting.")
-        return None, None
+        return None, None, None, None
         
     if msg.get('type') == 'handshake_1':
         print(f"  Processing 'handshake_1' from {peer_id}...")
@@ -253,7 +272,7 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
         
         if not verify_signature(peer_rsa_pub, peer_sig, data_to_verify):
             print("[!] Peer's handshake signature is INVALID! Aborting.")
-            return None, None
+            return None, None, None, None
         
         print("  Peer signature verified.")
         
@@ -281,14 +300,14 @@ def perform_handshake_receiver(sock, my_id, my_private_key):
         send_secure_message(sock, json.dumps(handshake_2).encode())
         print("  Sent handshake_2.")
         
-        return master_key, peer_id # <-- RETURN MASTER KEY
+        # RETURN a tuple of all 4 critical items
+        return master_key, peer_id, ec_private_key, peer_ec_pub_key
         
     else:
         print(f"[!] Unknown handshake message type: {msg.get('type')}")
-        return None, None
+        return None, None, None, None
 
 # --- 4. The Listener Thread (Unchanged) ---
-
 def start_listener(my_ip, my_port):
     """Listens for incoming connections and puts them in a queue."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -298,7 +317,6 @@ def start_listener(my_ip, my_port):
         s.bind((my_ip, my_port))
         s.listen(5)
         print(f"[*] Listening on {my_ip}:{my_port}")
-
         while True:
             conn, addr = s.accept()
             print(f"\n[!] Incoming connection from {addr[0]}")
@@ -308,15 +326,13 @@ def start_listener(my_ip, my_port):
         print(f"[!] Listener socket error: {e}")
     finally:
         s.close()
-        
+            
 # --- 5. The Chat Session (Dual Ratchet Logic) ---
-
 stop_chat_thread = threading.Event()
-
-def receive_messages(sock, chat_state, peer_public_key):
+def receive_messages(sock, chat_state):
     """
     Target function for the receive thread.
-    Manages the RECEIVING chain key.
+    Manages the RECEIVING chain key and DH ratchet updates.
     """
     global stop_chat_thread
     sock.settimeout(INACTIVITY_TIMEOUT)
@@ -328,42 +344,79 @@ def receive_messages(sock, chat_state, peer_public_key):
             if not iv_and_ciphertext:
                 print("\n[!] Peer disconnected.")
                 break
-
-            current_key_to_use = None
+            
+            # 1. Get current receiving key bundle
             with chat_state['lock']:
-                # Increment receiving count
-                chat_state['receiving_count'] += 1
-                
-                # Check if it's time to re-key the RECEIVING chain
-                if chat_state['receiving_count'] > REKEY_AFTER_MESSAGES:
-                    print(f"\n[!] ({REKEY_AFTER_MESSAGES} msgs received) RE-KEYING (Receive Chain)...")
-                    # Derive new key from old key
-                    chat_state['receiving_key'] = kdf_chain_step(
-                        chat_state['receiving_key'], 
-                        "ratchet-step" # Use a constant string
-                    )
-                    chat_state['receiving_count'] = 1 # This is message 1 of the new key
-                    print(f"[!] New receiving key derived.")
-
-                current_key_to_use = chat_state['receiving_key']
+                current_key_bundle = chat_state['receiving_key']
             
-            # Decrypt the payload to get the JSON string
-            message_json_str = decrypt_message(current_key_to_use, iv_and_ciphertext)
+            aes_key = current_key_bundle[:AES_KEY_SIZE]
+            hmac_key = current_key_bundle[AES_KEY_SIZE:]
             
-            payload = json.loads(message_json_str)
-            message_text = payload['msg']
-            signature_b64 = payload['sig']
+            # 2. Decrypt the outer message
+            final_json_str = decrypt_message(aes_key, iv_and_ciphertext)
+            final_payload = json.loads(final_json_str)
             
-            # Verify the signature
-            signature_bytes = base64.b64decode(signature_b64)
-            data_to_verify = message_text.encode('utf-8')
+            payload_json_str = final_payload['p']
+            hmac_b64 = final_payload['hmac']
+            hmac_tag = base64.b64decode(hmac_b64)
             
-            if verify_signature(peer_public_key, signature_bytes, data_to_verify):
-                print(f"\rPeer: {message_text}      \nYou: ", end="")
-            else:
-                print(f"\n[!] INVALID SIGNATURE received for message: '{message_text}'")
+            # 3. Verify HMAC
+            if not verify_hmac(hmac_key, hmac_tag, payload_json_str.encode('utf-8')):
+                print("\n[!] INVALID HMAC! Message discarded. Tampering suspected.")
                 print("You: ", end="") # Re-draw prompt
-
+                continue
+                
+            # 4. HMAC is valid. Process the inner payload.
+            payload = json.loads(payload_json_str)
+            message_text = payload['msg']
+            msg_num = payload['msg_num']
+            peer_dh_pub_key_b64 = payload.get('dh_pub_key') # This will be present on re-key
+            
+            # 5. Acquire lock to update state
+            with chat_state['lock']:
+                # Check for out-of-order messages
+                if msg_num <= chat_state['receiving_msg_num']:
+                    print(f"\n[!] Received out-of-order message (Num: {msg_num}). Discarding.")
+                    print("You: ", end="") # Re-draw prompt
+                    continue
+                    
+                chat_state['receiving_msg_num'] = msg_num
+                
+                # Check if this message is triggering a DH ratchet step
+                if peer_dh_pub_key_b64:
+                    print(f"\n[!] ({REKEY_AFTER_MESSAGES} msgs received) RE-KEYING (DH Ratchet)...")
+                    
+                    # Load the peer's new public key
+                    peer_dh_pub_bytes = base64.b64decode(peer_dh_pub_key_b64)
+                    peer_dh_pub_key = serialization.load_pem_public_key(peer_dh_pub_bytes, default_backend())
+                    
+                    # Get our *current* private key
+                    my_dh_key = chat_state['my_dh_key']
+                    
+                    # Calculate the new root key
+                    new_root_key = my_dh_key.exchange(ec.ECDH(), peer_dh_pub_key)
+                    
+                    # Update state
+                    chat_state['root_key'] = new_root_key
+                    chat_state['peer_dh_pub_key'] = peer_dh_pub_key # Update peer's key
+                    # Note: We don't update my_dh_key here, the *sender* does.
+                    
+                    # Derive new chain keys
+                    send_info = chat_state['send_info']
+                    recv_info = chat_state['recv_info']
+                    
+                    chat_state['sending_key'] = kdf_derive_key(new_root_key, send_info, BUNDLE_KEY_SIZE)
+                    chat_state['receiving_key'] = kdf_derive_key(new_root_key, recv_info, BUNDLE_KEY_SIZE)
+                    
+                    # Reset counters
+                    chat_state['sending_msg_num'] = 0
+                    chat_state['receiving_msg_num'] = 0 # This message was #5 (or #10, etc)
+                    
+                    print(f"[!] New Root Key and Chain Keys derived.")
+                
+            # 6. Finally, print the message
+            print(f"\rPeer: {message_text}      \nYou: ", end="")
+            
         except socket.timeout:
             print(f"\n[!] Chat timed out after {INACTIVITY_TIMEOUT}s of inactivity.")
             break
@@ -384,39 +437,52 @@ def receive_messages(sock, chat_state, peer_public_key):
         sock.close()
     except OSError:
         pass 
-
-def start_chat_session(conn, initial_sending_key, initial_receiving_key, peer_id, my_private_key):
+def start_chat_session(conn, master_key, my_dh_key, peer_dh_pub_key, am_i_initiator):
     """
     Manages an active chat with separate send/receive ratchets.
     """
     global stop_chat_thread
     stop_chat_thread.clear()
     
-    peer_public_key = load_peer_public_key(peer_id)
-    if not peer_public_key:
-        print(f"[!] Critical: Could not load peer's public key for {peer_id}. Cannot verify messages.")
-        conn.close()
-        return
-
+    # Determine roles for key derivation
+    send_info, recv_info = "", ""
+    if am_i_initiator:
+        send_info = "initiator-sends"
+        recv_info = "receiver-sends"
+    else:
+        send_info = "receiver-sends"
+        recv_info = "initiator-sends"
+        
+    # Derive initial chain keys from the master key
+    initial_sending_key = kdf_derive_key(master_key, send_info, BUNDLE_KEY_SIZE)
+    initial_receiving_key = kdf_derive_key(master_key, recv_info, BUNDLE_KEY_SIZE)
+    
     # Create the shared state object for both chains
     chat_state = {
         'lock': threading.Lock(),
-        'sending_key': initial_sending_key,
-        'sending_count': 0,
-        'receiving_key': initial_receiving_key,
-        'receiving_count': 0
+        'root_key': master_key,
+        'my_dh_key': my_dh_key,         # Our *current* private key for DH
+        'peer_dh_pub_key': peer_dh_pub_key, # Peer's *current* public key for DH
+        
+        'sending_key': initial_sending_key,     # 48-byte bundle (AES+HMAC)
+        'sending_msg_num': 0,
+        'receiving_key': initial_receiving_key, # 48-byte bundle (AES+HMAC)
+        'receiving_msg_num': 0,
+        
+        'send_info': send_info, # Store for re-keying
+        'recv_info': recv_info  # Store for re-keying
     }
-
-    print(f"\n--- SECURE Ratchet Chat Started! (Re-keys every {REKEY_AFTER_MESSAGES} msgs per chain) ---")
-
+    
+    print(f"\n--- SECURE Ratchet Chat Started! (Re-keys every {REKEY_AFTER_MESSAGES} msgs) ---")
+    
     # Start the receive thread
     receiver = threading.Thread(
         target=receive_messages, 
-        args=(conn, chat_state, peer_public_key), 
+        args=(conn, chat_state), 
         daemon=True
     )
     receiver.start()
-
+    
     # Use the main thread for sending
     while not stop_chat_thread.is_set():
         try:
@@ -424,49 +490,127 @@ def start_chat_session(conn, initial_sending_key, initial_receiving_key, peer_id
             
             if len(message_text.strip())==0:
                 continue
-                
+                    
             if stop_chat_thread.is_set():
                 print("[!] Connection is closed. Cannot send message.")
                 break
-                
+                        
             if message_text.lower() == 'exit':
                 break
-
-            current_key_to_use = None
-            # Atomically update counter and get current key
+            
+            current_send_bundle = None
+            current_msg_num = 0
+            dh_pub_bytes_to_send = None
+            
+            # Atomically update counter and check for re-key
             with chat_state['lock']:
-                # Increment SENDING count
-                chat_state['sending_count'] += 1
+                chat_state['sending_msg_num'] += 1
+                current_msg_num = chat_state['sending_msg_num']
                 
                 # Check if it's time to re-key the SENDING chain
-                if chat_state['sending_count'] > REKEY_AFTER_MESSAGES:
-                    print(f"\n[!] ({REKEY_AFTER_MESSAGES} msgs sent) RE-KEYING (Send Chain)...")
-                    # Derive new key from old key
-                    chat_state['sending_key'] = kdf_chain_step(
-                        chat_state['sending_key'], 
-                        "ratchet-step" # Use the same constant string
+                if current_msg_num == REKEY_AFTER_MESSAGES:
+                    print(f"\n[!] ({REKEY_AFTER_MESSAGES} msgs sent) RE-KEYING (DH Ratchet)...")
+                    
+                    # 1. Generate our *new* DH key pair
+                    new_my_dh_key = ec.generate_private_key(ec.SECP384R1(), default_backend())
+                    new_my_dh_pub = new_my_dh_key.public_key()
+                    dh_pub_bytes_to_send = new_my_dh_pub.public_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PublicFormat.SubjectPublicKeyInfo
                     )
-                    chat_state['sending_count'] = 1 # This is message 1 of the new key
-                    print(f"[!] New sending key derived.")
+                    
+                    # 2. Get peer's *current* public key
+                    current_peer_dh_pub = chat_state['peer_dh_pub_key']
+                    
+                    # 3. Calculate new root key
+                    new_root_key = new_my_dh_key.exchange(ec.ECDH(), current_peer_dh_pub)
+                    
+                    # 4. Update state *immediately*
+                    chat_state['root_key'] = new_root_key
+                    chat_state['my_dh_key'] = new_my_dh_key # Our private key is updated
+                    # Note: peer_dh_pub_key is NOT updated yet.
+                    
+                    # 5. Derive new chain keys
+                    chat_state['sending_key'] = kdf_derive_key(new_root_key, send_info, BUNDLE_KEY_SIZE)
+                    chat_state['receiving_key'] = kdf_derive_key(new_root_key, recv_info, BUNDLE_KEY_SIZE)
+                    
+                    # 6. Reset counters
+                    chat_state['sending_msg_num'] = 0
+                    chat_state['receiving_msg_num'] = 0
+                    
+                    print(f"[!] New Root Key and Chain Keys derived. Attaching new PubKey to message.")
                 
-                current_key_to_use = chat_state['sending_key']
-
-            # 1. Sign the message
-            data_to_sign = message_text.encode('utf-8')
-            signature = sign_data(my_private_key, data_to_sign)
-
-            # 2. Package into JSON
+                # Get the key to use for *this* message
+                # Note: If we re-keyed, we use the *old* key for this message
+                # This is "Encrypt-then-Ratchet"
+                # ... actually, that's complex. Let's use the new key right away.
+                # The logic above already updated chat_state['sending_key']
+                
+                # Re-reading... no, the logic above ONLY runs if msg_num == REKEY...
+                # Let's re-think. This is the race condition.
+                
+                # --- Let's try the "Ratchet-then-Encrypt" model ---
+                # The logic in the lock is fine. If we rekeyed, chat_state['sending_key']
+                # is *already* the new key.
+                
+                # Let's fix the counter.
+                if current_msg_num > REKEY_AFTER_MESSAGES:
+                    # This is message #6. It needs to be message #1.
+                    chat_state['sending_msg_num'] = 1
+                    current_msg_num = 1
+                    
+                    print(f"\n[!] ({REKEY_AFTER_MESSAGES} msgs sent) RE-KEYING (DH Ratchet)...")
+                    new_my_dh_key = ec.generate_private_key(ec.SECP384R1(), default_backend())
+                    new_my_dh_pub = new_my_dh_key.public_key()
+                    dh_pub_bytes_to_send = new_my_dh_pub.public_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PublicFormat.SubjectPublicKeyInfo
+                    )
+                    
+                    current_peer_dh_pub = chat_state['peer_dh_pub_key']
+                    new_root_key = new_my_dh_key.exchange(ec.ECDH(), current_peer_dh_pub)
+                    
+                    chat_state['root_key'] = new_root_key
+                    chat_state['my_dh_key'] = new_my_dh_key
+                    
+                    chat_state['sending_key'] = kdf_derive_key(new_root_key, send_info, BUNDLE_KEY_SIZE)
+                    chat_state['receiving_key'] = kdf_derive_key(new_root_key, recv_info, BUNDLE_KEY_SIZE)
+                    
+                    chat_state['receiving_msg_num'] = 0 # Reset receiving counter
+                    print(f"[!] New Root Key and Chain Keys derived. Attaching new PubKey to message.")
+                
+                current_send_bundle = chat_state['sending_key']
+            
+            # --- End of lock ---
+            
+            # 1. Split the key bundle
+            aes_key = current_send_bundle[:AES_KEY_SIZE]
+            hmac_key = current_send_bundle[AES_KEY_SIZE:]
+            
+            # 2. Package inner payload
             payload = {
                 'msg': message_text,
-                'sig': base64.b64encode(signature).decode('utf-8')
+                'msg_num': current_msg_num
             }
-            message_json_str = json.dumps(payload)
-
-            # 3. Encrypt the JSON string using the current SENDING key
-            print("Message => {} current_key => {}".format(message_json_str, current_key_to_use))
-            iv_and_ciphertext = encrypt_message(current_key_to_use, message_json_str)
+            if dh_pub_bytes_to_send:
+                payload['dh_pub_key'] = base64.b64encode(dh_pub_bytes_to_send).decode('utf-8')
+                
+            payload_json_str = json.dumps(payload)
             
-            # 4. Send securely
+            # 3. Create HMAC
+            hmac_tag = generate_hmac(hmac_key, payload_json_str.encode('utf-8'))
+            
+            # 4. Package outer payload
+            final_payload = {
+                'p': payload_json_str, # 'p' for payload
+                'hmac': base64.b64encode(hmac_tag).decode('utf-8')
+            }
+            final_json_str = json.dumps(final_payload)
+            
+            # 5. Encrypt the outer payload
+            iv_and_ciphertext = encrypt_message(aes_key, final_json_str)
+            
+            # 6. Send securely
             send_secure_message(conn, iv_and_ciphertext)
             
         except (EOFError, KeyboardInterrupt):
@@ -488,8 +632,7 @@ def start_chat_session(conn, initial_sending_key, initial_receiving_key, peer_id
             pass
         conn.close()
 
-# --- 6. The Main (UI) Thread (Modified to pass keys) ---
-
+# --- 6. The Main (UI) Thread (Modified to pass DH keys) ---
 def main_ui():
     """The main user-facing loop."""
     
@@ -502,7 +645,7 @@ def main_ui():
     print(f"Welcome, {MY_ID}!")
     MY_PRIVATE_KEY = load_my_private_key(MY_ID)
     print("Your RSA private key is loaded.")
-
+    
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -510,22 +653,23 @@ def main_ui():
         s.close()
     except Exception:
         my_ip = "127.0.0.1"
+        
     print(f"Your IP appears to be: {my_ip}")
-
+    
     listener = threading.Thread(
         target=start_listener, 
         args=('0.0.0.0', MY_PORT), 
         daemon=True
     )
     listener.start()
-
+    
     while True:
         print("\n--- Main Menu ---")
         print("1. Connect to a peer")
         print("2. Check for incoming connections")
         print("3. Quit")
         choice = input("Enter your choice (1-3): ")
-
+        
         if choice == '1':
             # This is the INITIATOR
             target_ip = input("Enter peer's IP address: ")
@@ -534,13 +678,13 @@ def main_ui():
             if load_peer_public_key(target_id) is None:
                 print(f"Cannot connect: No public key found for {target_id}.")
                 continue
-
             try:
                 print(f"Connecting to {target_ip}:{MY_PORT}...")
                 client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 client_sock.connect((target_ip, MY_PORT))
                 
-                master_key = perform_handshake_initiator(
+                # Perform handshake, now getting DH keys back
+                master_key, my_dh_key, peer_dh_pub_key = perform_handshake_initiator(
                     client_sock, 
                     MY_ID, 
                     MY_PRIVATE_KEY, 
@@ -548,18 +692,13 @@ def main_ui():
                 )
                 
                 if master_key:
-                    print("[+] Handshake successful! Deriving chain keys...")
-                    # Initiator's sending key
-                    init_send_key = kdf_chain_step(master_key, "initiator-sends")
-                    # Initiator's receiving key (derived from peer's send key)
-                    init_recv_key = kdf_chain_step(master_key, "receiver-sends")
-                    
+                    print("[+] Handshake successful! Starting ratchet session...")
                     start_chat_session(
                         client_sock, 
-                        init_send_key, 
-                        init_recv_key, 
-                        target_id, 
-                        MY_PRIVATE_KEY
+                        master_key,
+                        my_dh_key,
+                        peer_dh_pub_key,
+                        am_i_initiator=True # This client is the initiator
                     )
                 else:
                     print("[-] Handshake failed. Connection closed.")
@@ -571,7 +710,7 @@ def main_ui():
                 print(f"[!] An error occurred during connection: {e}")
                 if 'client_sock' in locals():
                     client_sock.close()
-
+                    
         elif choice == '2':
             # This is the RECEIVER
             if connection_requests.empty():
@@ -581,25 +720,21 @@ def main_ui():
                 print(f"\nProcessing incoming request from {addr[0]}...")
                 
                 try:
-                    master_key, peer_id = perform_handshake_receiver(
+                    # Perform handshake, now getting DH keys back
+                    master_key, peer_id, my_dh_key, peer_dh_pub_key = perform_handshake_receiver(
                         conn, 
                         MY_ID, 
                         MY_PRIVATE_KEY
                     )
                     
                     if master_key and peer_id:
-                        print(f"[+] Handshake with {peer_id} successful! Deriving chain keys...")
-                        # Receiver's sending key
-                        recv_send_key = kdf_chain_step(master_key, "receiver-sends")
-                        # Receiver's receiving key (derived from peer's send key)
-                        recv_recv_key = kdf_chain_step(master_key, "initiator-sends")
-                        
+                        print(f"[+] Handshake with {peer_id} successful! Starting ratchet session...")
                         start_chat_session(
                             conn, 
-                            recv_send_key, 
-                            recv_recv_key, 
-                            peer_id, 
-                            MY_PRIVATE_KEY
+                            master_key,
+                            my_dh_key,
+                            peer_dh_pub_key,
+                            am_i_initiator=False # This client is the receiver
                         )
                     else:
                         print("[-] Handshake failed. Closing connection.")
